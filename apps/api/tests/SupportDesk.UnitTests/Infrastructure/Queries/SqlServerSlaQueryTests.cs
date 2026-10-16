@@ -66,4 +66,117 @@ public sealed class SqlServerSlaQueryTests
         Assert.True(result.TotalCount >= 0);
         Assert.All(result.Items, item => Assert.Equal(SlaStatus.AtRisk, item.SlaStatus));
     }
+
+    [Fact]
+    public async Task GetPagedAsync_Breached_TranslatesAndExecutesOnSqlServer()
+    {
+        var options = new DbContextOptionsBuilder<SupportDbContext>()
+            .UseSqlServer(ConnectionString)
+            .Options;
+
+        using var db = new SupportDbContext(options);
+        var clock = new FixedClock(DateTime.UtcNow);
+        var sut = new TicketQueries(db, clock);
+
+        var query = new TicketQuery
+        {
+            Page = 1,
+            PageSize = 20,
+            SlaStatus = SlaStatus.Breached,
+            SortBy = "createdAtUtc",
+            SortDirection = "desc"
+        };
+
+        var result = await sut.GetPagedAsync(query, CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.True(result.TotalCount >= 0);
+        Assert.All(result.Items, item => Assert.Equal(SlaStatus.Breached, item.SlaStatus));
+    }
+
+    [Fact]
+    public async Task GetPagedAsync_Met_TranslatesAndExecutesOnSqlServer()
+    {
+        var options = new DbContextOptionsBuilder<SupportDbContext>()
+            .UseSqlServer(ConnectionString)
+            .Options;
+
+        using var db = new SupportDbContext(options);
+        var clock = new FixedClock(DateTime.UtcNow);
+        var sut = new TicketQueries(db, clock);
+
+        var query = new TicketQuery
+        {
+            Page = 1,
+            PageSize = 20,
+            SlaStatus = SlaStatus.Met,
+            SortBy = "createdAtUtc",
+            SortDirection = "desc"
+        };
+
+        var result = await sut.GetPagedAsync(query, CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.True(result.TotalCount >= 0);
+        Assert.All(result.Items, item => Assert.Equal(SlaStatus.Met, item.SlaStatus));
+    }
+
+    [Fact]
+    public async Task GetPagedAsync_NotApplicable_TranslatesAndExecutesOnSqlServer()
+    {
+        var options = new DbContextOptionsBuilder<SupportDbContext>()
+            .UseSqlServer(ConnectionString)
+            .Options;
+
+        using var db = new SupportDbContext(options);
+        var clock = new FixedClock(DateTime.UtcNow);
+        var sut = new TicketQueries(db, clock);
+
+        var query = new TicketQuery
+        {
+            Page = 1,
+            PageSize = 20,
+            SlaStatus = SlaStatus.NotApplicable,
+            SortBy = "createdAtUtc",
+            SortDirection = "desc"
+        };
+
+        var result = await sut.GetPagedAsync(query, CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.True(result.TotalCount >= 0);
+        Assert.All(result.Items, item => Assert.Equal(SlaStatus.NotApplicable, item.SlaStatus));
+    }
+
+    [Fact]
+    public async Task GetPagedAsync_CombinedWithPriorityAndAssignee_TranslatesAndExecutesOnSqlServer()
+    {
+        var options = new DbContextOptionsBuilder<SupportDbContext>()
+            .UseSqlServer(ConnectionString)
+            .Options;
+
+        using var db = new SupportDbContext(options);
+        var clock = new FixedClock(DateTime.UtcNow);
+        var sut = new TicketQueries(db, clock);
+
+        var query = new TicketQuery
+        {
+            Page = 1,
+            PageSize = 10,
+            SlaStatus = SlaStatus.WithinSla,
+            Priority = TicketPriority.High,
+            SortBy = "dueAtUtc",
+            SortDirection = "asc"
+        };
+
+        var result = await sut.GetPagedAsync(query, CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.True(result.TotalCount >= 0);
+        Assert.All(result.Items, item =>
+        {
+            Assert.Equal(SlaStatus.WithinSla, item.SlaStatus);
+            Assert.Equal(TicketPriority.High, item.Priority);
+        });
+    }
 }

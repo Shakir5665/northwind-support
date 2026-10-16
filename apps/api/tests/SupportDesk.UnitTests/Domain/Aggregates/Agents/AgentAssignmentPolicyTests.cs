@@ -165,4 +165,144 @@ public class AgentAssignmentPolicyTests
         Assert.Equal(otherAgent.Id, selected.Id);
         Assert.Contains("Assigned to Bob", reason);
     }
+
+    [Fact]
+    public void SelectAgent_WhenCandidatesEmpty_ReturnsNullWithReason()
+    {
+        var (selected, reason) = AgentAssignmentPolicy.SelectAgent(new List<AgentWorkload>(), _generalCategory);
+
+        Assert.Null(selected);
+        Assert.Contains("No active agents available", reason);
+    }
+
+    [Fact]
+    public void SelectAgent_WhenAllCandidatesInactive_ReturnsNullWithReason()
+    {
+        var agent1 = new Agent("Alex", "alex@example.com", 10, Now).WithId(1);
+        agent1.Deactivate();
+        var agent2 = new Agent("Bob", "bob@example.com", 10, Now).WithId(2);
+        agent2.Deactivate();
+
+        var candidates = new List<AgentWorkload>
+        {
+            new(agent1, 0),
+            new(agent2, 0)
+        };
+
+        var (selected, reason) = AgentAssignmentPolicy.SelectAgent(candidates, _generalCategory);
+
+        Assert.Null(selected);
+        Assert.Contains("No active agents available", reason);
+    }
+
+    [Fact]
+    public void SelectAgent_WhenAllEligibleAgentsAtCapacity_ReturnsNullWithReason()
+    {
+        var agent1 = new Agent("Alex", "alex@example.com", maxOpenTickets: 3, Now).WithId(1);
+        var agent2 = new Agent("Bob", "bob@example.com", maxOpenTickets: 2, Now).WithId(2);
+
+        var candidates = new List<AgentWorkload>
+        {
+            new(agent1, OpenTicketCount: 3), // At capacity
+            new(agent2, OpenTicketCount: 2)  // At capacity
+        };
+
+        var (selected, reason) = AgentAssignmentPolicy.SelectAgent(candidates, _generalCategory);
+
+        Assert.Null(selected);
+        Assert.Contains("maximum open ticket capacity", reason);
+    }
+
+    [Fact]
+    public void SelectAgent_WhenAllSpecialistsAtCapacity_ReturnsNullWithSpecificReason()
+    {
+        var specialist1 = new Agent("Sara", "sara@example.com", maxOpenTickets: 2, Now).WithId(1);
+        specialist1.AddSpecialization(_billingSpecialistCategory.Id);
+        var specialist2 = new Agent("Sam", "sam@example.com", maxOpenTickets: 3, Now).WithId(2);
+        specialist2.AddSpecialization(_billingSpecialistCategory.Id);
+
+        var candidates = new List<AgentWorkload>
+        {
+            new(specialist1, OpenTicketCount: 2), // At capacity
+            new(specialist2, OpenTicketCount: 3)  // At capacity
+        };
+
+        var (selected, reason) = AgentAssignmentPolicy.SelectAgent(candidates, _billingSpecialistCategory);
+
+        Assert.Null(selected);
+        Assert.Contains("All agents specialized in category 'Billing' are currently at maximum capacity", reason);
+    }
+
+    [Fact]
+    public void ReevaluateAgentForEscalation_WhenNoCurrentAgent_AssignsBestEligibleAgent()
+    {
+        var agent = new Agent("Sara", "sara@example.com", 10, Now).WithId(1);
+        var candidates = new List<AgentWorkload> { new(agent, 2) };
+
+        var (selected, reason) = AgentAssignmentPolicy.ReevaluateAgentForEscalation(
+            null, candidates, _generalCategory);
+
+        Assert.NotNull(selected);
+        Assert.Equal(agent.Id, selected.Id);
+        Assert.Contains("Sara", reason);
+    }
+
+    [Fact]
+    public void ReevaluateAgentForEscalation_WhenCurrentAgentExceedsCapacity_Reassigns()
+    {
+        var currentAgent = new Agent("Alex", "alex@example.com", maxOpenTickets: 5, Now).WithId(1);
+        var otherAgent = new Agent("Bob", "bob@example.com", maxOpenTickets: 10, Now).WithId(2);
+
+        var candidates = new List<AgentWorkload>
+        {
+            new(currentAgent, OpenTicketCount: 6), // Strictly exceeds max capacity
+            new(otherAgent, OpenTicketCount: 1)
+        };
+
+        var (selected, reason) = AgentAssignmentPolicy.ReevaluateAgentForEscalation(
+            currentAgent.Id, candidates, _generalCategory);
+
+        Assert.NotNull(selected);
+        Assert.Equal(otherAgent.Id, selected.Id);
+        Assert.Contains("Bob", reason);
+    }
+
+    [Fact]
+    public void ReevaluateAgentForEscalation_WhenCurrentAgentLacksRequiredSpecialization_ReassignsToSpecialist()
+    {
+        var nonSpecialist = new Agent("Alex", "alex@example.com", 10, Now).WithId(1);
+        var specialist = new Agent("Sara", "sara@example.com", 10, Now).WithId(2);
+        specialist.AddSpecialization(_billingSpecialistCategory.Id);
+
+        var candidates = new List<AgentWorkload>
+        {
+            new(nonSpecialist, OpenTicketCount: 1),
+            new(specialist, OpenTicketCount: 3)
+        };
+
+        var (selected, reason) = AgentAssignmentPolicy.ReevaluateAgentForEscalation(
+            nonSpecialist.Id, candidates, _billingSpecialistCategory);
+
+        Assert.NotNull(selected);
+        Assert.Equal(specialist.Id, selected.Id);
+        Assert.Contains("Sara", reason);
+    }
+
+    [Fact]
+    public void ReevaluateAgentForEscalation_WhenNoAgentIsEligible_ReturnsNull()
+    {
+        var currentAgent = new Agent("Alex", "alex@example.com", 10, Now).WithId(1);
+        currentAgent.Deactivate();
+
+        var candidates = new List<AgentWorkload>
+        {
+            new(currentAgent, OpenTicketCount: 2)
+        };
+
+        var (selected, reason) = AgentAssignmentPolicy.ReevaluateAgentForEscalation(
+            currentAgent.Id, candidates, _generalCategory);
+
+        Assert.Null(selected);
+        Assert.Contains("No active agents available", reason);
+    }
 }

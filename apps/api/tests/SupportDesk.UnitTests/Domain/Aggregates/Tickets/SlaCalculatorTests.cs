@@ -80,4 +80,32 @@ public class SlaCalculatorTests
         Assert.Equal(TimeSpan.FromHours(4), window);
         Assert.Equal(Start.AddHours(4), dueAtUtc);
     }
+
+    [Fact]
+    public void CalculateDueDate_WhenOptionsIsNull_ThrowsArgumentNullException()
+    {
+        Assert.Throws<ArgumentNullException>(() =>
+            SlaCalculator.CalculateDueDate(TicketPriority.High, CustomerTier.Standard, null!, Start));
+    }
+
+    [Fact]
+    public void CalculateDueDate_CustomMinimumFloor_FloorsToConfiguredHours()
+    {
+        var customOptions = new SlaOptions
+        {
+            BaseWindowHours = new Dictionary<string, int>
+            {
+                [nameof(TicketPriority.Critical)] = 4
+            },
+            PremiumCustomerMultiplier = 0.5, // 4 * 0.5 = 2 hours
+            MinimumWindowHours = 3           // Configured minimum is 3 hours -> floored to 3 hours
+        };
+
+        var (window, dueAtUtc, reason) = SlaCalculator.CalculateDueDate(
+            TicketPriority.Critical, CustomerTier.Premium, customOptions, Start);
+
+        Assert.Equal(TimeSpan.FromHours(3), window);
+        Assert.Equal(Start.AddHours(3), dueAtUtc);
+        Assert.Contains("floored to minimum 3h", reason);
+    }
 }

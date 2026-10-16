@@ -195,12 +195,13 @@ describe('EscalationPanel', () => {
     expect(actorInput.value).toBe('');
   });
 
-  it('handles server HTTP 409 conflict error (e.g. ticket already Critical or Resolved on server)', async () => {
+  it('handles server HTTP 409 conflict error (e.g. ticket already Critical or Resolved on server) and does not update ticket', async () => {
     escalateMock.mockRejectedValue(
       new ApiError(409, 'Ticket cannot be escalated because it is already Critical.'),
     );
 
-    render(<EscalationPanel ticket={baseTicket} onEscalated={vi.fn()} />);
+    const onEscalated = vi.fn();
+    render(<EscalationPanel ticket={baseTicket} onEscalated={onEscalated} />);
 
     fireEvent.change(screen.getByLabelText(/escalated by/i), {
       target: { value: 'Support Lead' },
@@ -214,6 +215,7 @@ describe('EscalationPanel', () => {
     expect(
       await screen.findByText('Ticket cannot be escalated because it is already Critical.'),
     ).toBeInTheDocument();
+    expect(onEscalated).not.toHaveBeenCalled();
   });
 
   it('handles server HTTP 404 ticket not found', async () => {

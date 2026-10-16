@@ -53,6 +53,23 @@ public class RaiseTicketCommandHandlerTests
 
         Assert.NotNull(context.AddedTicket);
         Assert.Equal(TicketPriority.Critical, context.AddedTicket.Priority);
+        // Standard customer Critical window is 4 hours, NOT Low window of 72 hours
+        Assert.Equal(FixedClock.DefaultNow.AddHours(4), context.AddedTicket.DueAtUtc);
+    }
+
+    [Fact]
+    public async Task HandleAsync_WhenCategoryForcesCriticalAndNoPriorityRequested_ForcesCriticalWithCriticalSla()
+    {
+        var context = new TicketCommandTestContext();
+        var securityCategory = new Category("Security", requiresSpecialist: true, forcesCriticalPriority: true);
+        context.Categories.Setup(c => c.GetByIdAsync(9, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(securityCategory);
+
+        await context.RaiseTicket.HandleAsync(Request(priority: null, categoryId: 9), CancellationToken.None);
+
+        Assert.NotNull(context.AddedTicket);
+        Assert.Equal(TicketPriority.Critical, context.AddedTicket.Priority);
+        Assert.Equal(FixedClock.DefaultNow.AddHours(4), context.AddedTicket.DueAtUtc);
     }
 
     [Fact]

@@ -91,4 +91,70 @@ public class SlaEvaluatorTests
 
         Assert.Equal(SlaStatus.AtRisk, status);
     }
+
+    [Fact]
+    public void Evaluate_ResolvedAtExactDueDate_ReturnsMet()
+    {
+        var dueAtUtc = Now;
+        var resolvedAtUtc = Now; // Exactly on due date
+        var status = SlaEvaluator.Evaluate(dueAtUtc, resolvedAtUtc, Now.AddDays(1), FourHours);
+
+        Assert.Equal(SlaStatus.Met, status);
+    }
+
+    [Fact]
+    public void Evaluate_ResolvedOneTickAfterDueDate_ReturnsBreached()
+    {
+        var dueAtUtc = Now;
+        var resolvedAtUtc = Now.AddTicks(1); // 1 tick late
+        var status = SlaEvaluator.Evaluate(dueAtUtc, resolvedAtUtc, Now.AddDays(1), FourHours);
+
+        Assert.Equal(SlaStatus.Breached, status);
+    }
+
+    [Fact]
+    public void Evaluate_UnresolvedOneTickPastDueDate_ReturnsBreached()
+    {
+        var dueAtUtc = Now;
+        var nowUtc = Now.AddTicks(1); // 1 tick past due
+        var status = SlaEvaluator.Evaluate(dueAtUtc, null, nowUtc, FourHours);
+
+        Assert.Equal(SlaStatus.Breached, status);
+    }
+
+    [Fact]
+    public void Evaluate_AtRiskThreshold_ExactSubSecondBoundaries()
+    {
+        var window = TimeSpan.FromSeconds(1000); // 25% threshold is 250s
+        var baseTime = Now;
+
+        // Just above 25% boundary (250.001s remaining) -> WithinSla
+        var dueJustAbove = baseTime.AddSeconds(250.001);
+        Assert.Equal(SlaStatus.WithinSla, SlaEvaluator.Evaluate(dueJustAbove, null, baseTime, window));
+
+        // Exact 25% boundary (250.000s remaining) -> AtRisk
+        var dueExact = baseTime.AddSeconds(250);
+        Assert.Equal(SlaStatus.AtRisk, SlaEvaluator.Evaluate(dueExact, null, baseTime, window));
+
+        // Just below 25% boundary (249.999s remaining) -> AtRisk
+        var dueJustBelow = baseTime.AddSeconds(249.999);
+        Assert.Equal(SlaStatus.AtRisk, SlaEvaluator.Evaluate(dueJustBelow, null, baseTime, window));
+    }
+
+    [Fact]
+    public void Evaluate_NullDueDateWithResolvedDate_ReturnsNotApplicable()
+    {
+        var status = SlaEvaluator.Evaluate(null, Now.AddHours(-1), Now);
+        Assert.Equal(SlaStatus.NotApplicable, status);
+    }
+
+    [Fact]
+    public void Evaluate_ZeroOrNegativeWindow_ReturnsWithinSlaIfBeforeDue()
+    {
+        var dueAtUtc = Now.AddHours(2);
+        // Zero window
+        Assert.Equal(SlaStatus.WithinSla, SlaEvaluator.Evaluate(dueAtUtc, null, Now, TimeSpan.Zero));
+        // Negative window
+        Assert.Equal(SlaStatus.WithinSla, SlaEvaluator.Evaluate(dueAtUtc, null, Now, TimeSpan.FromHours(-1)));
+    }
 }

@@ -251,4 +251,48 @@ public class EscalateTicketCommandHandlerTests
         Assert.False(result.IsValid);
         Assert.Contains(result.Errors, e => e.PropertyName == nameof(request.EscalatedBy));
     }
+
+    [Fact]
+    public void Validator_BoundaryLengths_EnforcesExactMinAndMax()
+    {
+        var validator = new EscalateTicketRequestValidator();
+
+        // 5 characters -> valid
+        var validMin = new EscalateTicketRequest("12345", "Valid Actor");
+        Assert.True(validator.Validate(validMin).IsValid);
+
+        // 4 characters -> invalid
+        var invalidMin = new EscalateTicketRequest("1234", "Valid Actor");
+        Assert.False(validator.Validate(invalidMin).IsValid);
+
+        // 500 characters -> valid
+        var validMax = new EscalateTicketRequest(new string('a', 500), "Valid Actor");
+        Assert.True(validator.Validate(validMax).IsValid);
+
+        // 501 characters -> invalid
+        var invalidMax = new EscalateTicketRequest(new string('a', 501), "Valid Actor");
+        Assert.False(validator.Validate(invalidMax).IsValid);
+    }
+
+    [Fact]
+    public async Task HandleAsync_WhenClockAdvanced_CalculatesDueDateStrictlyFromCurrentInjectedTime()
+    {
+        var createdAt = _context.Clock.UtcNow;
+        var initialDue = createdAt.AddHours(24);
+        var ticket = CreateTicket(priority: TicketPriority.Medium, dueAtUtc: initialDue);
+        _context.ExistingTicket(ticket);
+
+        // Advance the injected clock by 10 hours
+        _context.Clock.Advance(TimeSpan.FromHours(10));
+        var escalationTime = _context.Clock.UtcNow;
+
+        // Standard customer escalating Medium -> High (High base window = 8 hours)
+        var request = new EscalateTicketRequest("Escalation after 10 hours delay", "Supervisor");
+        var result = await _context.EscalateTicket.HandleAsync(ticket.Id, request, CancellationToken.None);
+
+        var expectedDue = escalationTime.AddHours(8);
+        Assert.Equal(expectedDue, result.Escalation.ToDueAtUtc);
+        Assert.Equal(expectedDue, ticket.DueAtUtc);
+        Assert.NotEqual(initialDue.AddHours(8), ticket.DueAtUtc);
+    }
 }

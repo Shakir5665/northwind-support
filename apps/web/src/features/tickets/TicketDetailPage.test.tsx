@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { ApiError } from '../../api/client';
 import { ticketsApi } from '../../api/tickets';
 import { useReferenceData } from '../../hooks/useReferenceData';
 import type { EscalationResponse, TicketDetail, TicketEscalation } from '../../types/api';
@@ -164,5 +165,73 @@ describe('TicketDetailPage', () => {
     expect(screen.getByText('Support Lead')).toBeInTheDocument();
     // Priority updated in summary
     expect(screen.getAllByText('High').length).toBeGreaterThan(0);
+  });
+
+  it('rejects an escalation reason shorter than the server minimum client-side without calling API or modifying ticket', async () => {
+    render(
+      <MemoryRouter initialEntries={['/tickets/15']}>
+        <Routes>
+          <Route path="/tickets/:id" element={<TicketDetailPage />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'VPN gateway latency spike' })).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(/escalated by/i), {
+      target: { value: 'Support Lead' },
+    });
+    fireEvent.change(screen.getByLabelText(/reason for escalation/i), {
+      target: { value: 'help' }, // 4 chars, minimum is 5
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /escalate to high/i }));
+
+    expect(
+      await screen.findByText('Escalation reason must be at least 5 characters.'),
+    ).toBeInTheDocument();
+    expect(mockEscalate).not.toHaveBeenCalled();
+    // Ticket priority remains Medium in summary
+    const priorityDd1 = screen.getByText('Priority').closest('div')?.querySelector('dd');
+    expect(priorityDd1).toHaveTextContent('Medium');
+    expect(priorityDd1).not.toHaveTextContent('High');
+  });
+
+  it('displays a 409 response clearly and does not falsely update the ticket as successfully escalated', async () => {
+    mockEscalate.mockRejectedValue(
+      new ApiError(409, 'Ticket cannot be escalated because it is already Critical.'),
+    );
+
+    render(
+      <MemoryRouter initialEntries={['/tickets/15']}>
+        <Routes>
+          <Route path="/tickets/:id" element={<TicketDetailPage />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'VPN gateway latency spike' })).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(/escalated by/i), {
+      target: { value: 'Support Lead' },
+    });
+    fireEvent.change(screen.getByLabelText(/reason for escalation/i), {
+      target: { value: 'Escalate to higher tier for urgent resolution' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /escalate to high/i }));
+
+    // 409 error message is clearly displayed
+    expect(
+      await screen.findByText('Ticket cannot be escalated because it is already Critical.'),
+    ).toBeInTheDocument();
+
+    // Priority remains Medium in summary (not updated to High)
+    const priorityDd2 = screen.getByText('Priority').closest('div')?.querySelector('dd');
+    expect(priorityDd2).toHaveTextContent('Medium');
+    expect(priorityDd2).not.toHaveTextContent('High');
+
+    // Escalation history still shows empty state
+    expect(screen.getByText('No escalation history for this ticket.')).toBeInTheDocument();
   });
 });
