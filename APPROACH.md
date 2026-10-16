@@ -81,6 +81,211 @@
     ```
 - **Test Results**: All 42 unit and query tests pass (`dotnet test apps/api/tests/SupportDesk.UnitTests`).
 
-#### 4. Known Limitations
-- Task 2 SLA status filter (`slaStatus`) is not yet implemented.
-- Search uses standard database pattern matching; full-text indexing and fuzzy matching are not part of this scope.
+---
+
+## Task 2: Ticket Escalation & Assignment
+
+### Task 2.1: Business Rules (BR-1 through BR-8)
+
+#### 1. Problem Analysis & Domain Modeling
+- **Problem**: Support team leads previously triaged tickets by hand to determine priority, SLA response due dates, and agent assignment. The goal is to automate triage decisions upon ticket creation and establish explicit business rules for ticket escalation, ownership re-evaluation, and SLA status derivation.
+- **Key Challenges & Placement**:
+  - Rules must be small, cohesive, testable domain units shared between ticket creation and ticket escalation.
+  - Zero hard-coded category names; category handling rules (`ForcesCriticalPriority`, `RequiresSpecialist`) must live in data on the `Category` aggregate.
+  - SLA windows, multipliers, minimum duration floor, and at-risk thresholds must be configurable without code changes (via `appsettings.json` / `SlaOptions`).
+  - Invariant enforcement (such as escalation eligibility, reason lengths, and priority transitions) must be strictly safeguarded in the domain layer.
+
+#### 2. Architecture & Design Decisions
+- **Rule Placement in Clean Architecture**:
+  - **`PriorityPolicy` (`SupportDesk.Domain.Aggregates.Tickets`)**: Pure static domain policy evaluating BR-1 (`category.ForcesCriticalPriority` forces `Critical`; otherwise `requestedPriority ?? Medium`) and BR-7 priority progression (`Low -> Medium -> High -> Critical`, rejecting already `Critical` tickets). Returns both determined priority and a human-readable reason string for triage transparency.
+  - **`SlaOptions` & `SlaCalculator` (`SupportDesk.Domain.Aggregates.Tickets`)**:
+    - `SlaOptions` is a strongly typed POCO matching the `"Sla"` configuration section (`BaseWindowHours`, `PremiumCustomerMultiplier`, `MinimumWindowHours`, `AtRiskThresholdPercent`).
+    - `SlaCalculator` computes SLA duration windows and resulting due dates from a specified timestamp (`startUtc`). Enforces BR-2 base windows (Critical 4h, High 8h, Medium 24h, Low 72h), BR-3 Premium customer tier reduction (`0.5x`), and the mandatory 1-hour minimum window floor (`MinimumWindowHours = 1`). Generates descriptive triage explanations.
+  - **`AgentWorkload` & `AgentAssignmentPolicy` (`SupportDesk.Domain.Aggregates.Agents`)**:
+    - `AgentWorkload` record pairs an `Agent` aggregate with their active open ticket count (`Status` not in `Resolved`, `Closed`).
+    - `AgentAssignmentPolicy.IsAgentEligible` enforces BR-4 (`RequiresSpecialist` requires matching category specialization) and BR-5 (`IsActive == true` and `openTicketCount < agent.MaxOpenTickets`).
+    - `AgentAssignmentPolicy.SelectAgent` selects the candidate with the fewest open tickets, breaking ties deterministically by `Agent.Id` ascending. If no agent is eligible, returns `null` with a diagnostic explanation (normal outcome, not an error).
+    - `AgentAssignmentPolicy.ReevaluateAgentForEscalation` (BR-7) verifies whether the current assigned agent remains active, qualified, and within capacity before considering reassignment.
+  - **`Ticket` Aggregate Invariants & `TicketEscalation` Entity (`SupportDesk.Domain.Aggregates.Tickets`)**:
+    - `Ticket.Raise(...)` supports setting initial triage decisions (`dueAtUtc`, `assignedAgentId`).
+    - `Ticket.Escalate(...)` encapsulates escalation state transitions: validates reason (5–500 chars) and actor, raises priority, updates due date from the escalation moment (`nowUtc`), updates assignee, and appends an immutable `TicketEscalation` history entity.
+    - Prevents escalating `Critical`, `Resolved`, or `Closed` tickets by throwing `BusinessRuleViolationException`.
+  - **`SlaEvaluator` (`SupportDesk.Domain.Aggregates.Tickets`)**:
+    - Implements BR-8 SLA status derivation with injectable `nowUtc`.
+    - Returns `NotApplicable` when `dueAtUtc == null`, `Met` when resolved on or before due date, `Breached` when resolved late or open past due date, `AtRisk` when unresolved inside window with $\le 25\%$ remaining, and `WithinSla` otherwise.
+    - Backwards-compatible 3-parameter overload preserved for callers where window duration is not provided.
+- **Rejected Alternatives**:
+  - *Embedding triage logic inside Application Command Handlers*: Would scatter business rules into use cases and prevent sharing identical priority/SLA/assignment rules between Create and Escalate.
+  - *Hardcoding Category Names (e.g. `category.Name == "Security"`)*: Fragile and violates the domain design where categories define their own handling behaviors via flags.
+  - *Storing Derived SLA Status in Database*: Violates BR-8 ("derived, never stored"). SLA status dynamically changes as time progresses without any database writes.
+
+#### 3. Verification & Testing
+- Added comprehensive unit test suites in `SupportDesk.UnitTests`:
+  - `PriorityPolicyTests.cs`: Forced-Critical categories (Outage/Security) always yield Critical; non-forcing categories respect requested priority or fallback to Medium; escalation priority step transitions from Low to Critical; throws on escalating Critical.
+  - `SlaCalculatorTests.cs`: Standard tier base windows (72h, 24h, 8h, 4h); Premium tier halving (36h, 12h, 4h, 2h); 1-hour minimum floor boundary enforcement; configurable options from settings.
+  - `AgentAssignmentPolicyTests.cs`: Fewest open tickets selection; deterministic tie-breaking by Agent.Id; specialist qualification filtering; capacity limit enforcement (strictly below max tickets); inactive agent exclusion; nobody eligible null fallback with reasons; escalation owner retention vs reassignment.
+  - `SlaEvaluatorTests.cs`: Exact boundary tests: NotApplicable, Met, Breached, AtRisk at exactly 25% window remaining, AtRisk at < 25%, AtRisk at exact due date, Breached at +1ms past due, WithinSla at > 25%.
+  - `TicketEscalationTests.cs`: Ticket aggregate state mutation; immutable history row generation; rejection of Critical, Resolved, and Closed tickets; validation of reason bounds (5–500 chars) and actor.
+- **Test Results**: All 88 backend unit tests pass (`dotnet test apps/api/tests/SupportDesk.UnitTests`).
+
+---
+
+### Task 2.2: Backend Business Rules Integration
+
+#### 1. Scope & Deliverables
+Integrated the Task 2.1 business rules into the backend Web API, persistence layer, and query pipelines:
+- **Deliverable A — Triage on Create (`POST /api/tickets`)**: Integrated BR-1 through BR-6 in `RaiseTicketCommandHandler`. Sets effective priority, calculates SLA due date via `SlaCalculator`, assigns eligible agents with fewest open tickets (or unassigned if none qualify), and populates a transparent `triage` response object.
+- **Deliverable B — Persistent Escalation History & Migration**: Created `TicketEscalations` entity mapping, configured foreign keys (`TicketId` Cascade, `AgentId` Restrict), composite index `(TicketId, EscalatedAtUtc)`, and generated EF Core migration `20261016165900_AddTicketEscalations`.
+- **Deliverable C — Escalation API (`POST /api/tickets/{id}/escalate`)**: Handled by `EscalateTicketCommandHandler`. Validates 5–500 character reason and actor, enforces status invariants (`409 Conflict` for Critical, Resolved, or Closed tickets; `404 Not Found` for unknown tickets), steps priority one level, recomputes SLA due date from escalation timestamp, re-evaluates current agent eligibility, and atomically persists ticket updates with audit history.
+- **Deliverable D — Escalation History API (`GET /api/tickets/{id}/escalations`)**: Implemented in `GetTicketEscalationsQueryHandler` and `ITicketQueries.GetEscalationsAsync`. Returns history ordered newest-first (`EscalatedAtUtc DESC`), returns `404 Not Found` for nonexistent tickets, and returns an empty list for tickets without escalations.
+- **Deliverable E — SQL-Based SLA Filtering (`GET /api/tickets?slaStatus=...`)**: Implemented in `TicketQueries.ApplyFilters`. Filters database records across all 5 SLA statuses (`NotApplicable`, `Met`, `Breached`, `AtRisk`, `WithinSla`) in SQL before total count calculation, deterministic sorting, and pagination.
+
+#### 2. Architecture & Design Decisions
+- **Clean Architecture & Separation of Concerns**:
+  - `TicketsController` remains thin, delegating command and query dispatching to dedicated application handlers (`RaiseTicketCommandHandler`, `EscalateTicketCommandHandler`, `GetTicketEscalationsQueryHandler`).
+  - Domain invariants (state transitions, eligibility checks, priority progression) remain strictly encapsulated in `Ticket` aggregate and domain policies (`PriorityPolicy`, `SlaCalculator`, `AgentAssignmentPolicy`).
+  - Read queries and database projections remain encapsulated in `TicketQueries` within `SupportDesk.Infrastructure`.
+- **Efficient Workload Querying (Eliminating N+1)**:
+  - Added `IAgentRepository.GetCandidateWorkloadsAsync` which executes a single SQL query joining `Agents` with an open ticket count group-by subquery (`Status` not in `Resolved`, `Closed`). Avoids loading entire ticket tables into application memory or firing N queries per agent candidate.
+- **Database Schema & Audit Immutability**:
+  - Table `TicketEscalations` records before/after priority, before/after agent ID, before/after due dates, actor, reason, and UTC timestamp.
+  - Foreign keys to `Agents` (`FromAgentId`, `ToAgentId`) use `DeleteBehavior.Restrict` so historical audit entries are never accidentally deleted if an agent record is removed.
+  - Foreign key to `Tickets` (`TicketId`) uses `DeleteBehavior.Cascade` ensuring audit cleanup if a parent ticket is removed.
+  - Composite index `IX_TicketEscalations_TicketId_EscalatedAtUtc` optimizes ticket-specific newest-first history retrieval.
+- **Atomic Unit of Work**:
+  - `Ticket.Escalate(...)` attaches the new `TicketEscalation` entity directly to the `Ticket` aggregate. `IUnitOfWork.SaveChangesAsync` persists both the updated ticket columns and the new escalation row in a single database transaction.
+- **SQL SLA Filter Translation Without In-Memory Materialization**:
+  - `SlaEvaluator` rules for `AtRisk` ($\le 25\%$ remaining) translate to SQL via `.Ticks` date difference arithmetic:
+    `remainingTicks * 4 <= totalWindowTicks` $\iff$ `(DueAtUtc.Ticks - nowTicks) * 4 <= (DueAtUtc.Ticks - CreatedAtUtc.Ticks)`.
+  - Translates seamlessly on both SQL Server (via `DATEDIFF_BIG`) and SQLite (via `julianday` ticks conversion), avoiding client-side evaluation warnings.
+
+#### 3. Verification & Testing
+- **Backend Unit & Integration Tests (`SupportDesk.UnitTests`)**: 126 passed, 0 failed, 0 skipped.
+  - `RaiseTicketCommandHandlerTests`: Priority fallback, forced-Critical categories, SLA standard/premium calculations, minimum floor, specialist qualification, lowest workload selection, deterministic tie-breaking, unassigned triage response.
+  - `EscalateTicketCommandHandlerTests`: Valid transitions (`Low -> Med -> High -> Critical`), Critical/Resolved/Closed conflicts (`409`), missing/invalid reason and actor validation (`400`), unknown ticket (`404`), owner retention when eligible, owner reassignment when ineligible, atomic persistence.
+  - `GetTicketEscalationsQueryHandlerTests`: Unknown ticket (`404`), empty history, and populated newest-first list.
+  - `TicketEscalationPersistenceTests`: SQLite in-memory persistence verifying schema constraints, nullable FKs/due dates, and cascade delete behavior.
+  - `TicketQueriesTests`: All 5 SLA filter statuses evaluated in SQL, combined with status/priority/search, verified filtered counts, pagination, and newest-first escalation retrieval with ticket isolation.
+- **Architecture Tests (`SupportDesk.ArchitectureTests`)**: 4 passed, 0 failed.
+  - Confirmed Clean Architecture layer dependencies are maintained.
+  - Confirmed EF Core persistence model matches the latest migration against SQL Server provider without pending changes.
+- **Frontend Tests (`apps/web`)**: 6 passed across 2 test suites, verifying API contract compatibility.
+
+---
+
+## Task 2.3 Frontend Business Rules Integration
+
+### Overview & Delivered Features
+
+Integrated the backend Task 2.2 business rules, API contracts, and triage/escalation workflows into the React 19 / TypeScript frontend under `apps/web/src/features/tickets`:
+
+| Requirement | Component / Hook | Delivered Behavior |
+|---|---|---|
+| **Req A: SLA Indicator** | `SlaIndicator.tsx`, `SlaCell.tsx`, `TicketSummary.tsx` | One reusable, fully typed component representing all 5 SLA states (`WithinSla`, `AtRisk`, `Breached`, `Met`, `NotApplicable`). Used in both ticket list and ticket detail summary. Conveys status using symbols, text labels, and color badges with accessible `aria-label`s. |
+| **Req B: SLA Status Filter** | `TicketFilters.tsx`, `useTicketList.ts`, `api/tickets.ts` | Filter dropdown with friendly labels ("All SLA statuses", "Within SLA", "At risk", "Breached", "Met", "No SLA"). Sends `slaStatus` as query parameter, combines with existing filters via AND semantics, resets pagination to page 1 on filter changes, and omits the parameter when cleared. |
+| **Req C: Escalation Panel** | `EscalationPanel.tsx`, `TicketDetailPage.tsx` | Submits `POST /api/tickets/{id}/escalate` with `reason` and `escalatedBy`. Client-side validation: reason 5–500 characters, actor non-empty $\le 100$ characters. Disables button while pending, prevents double submissions, handles HTTP 400/404/409 errors, and updates ticket in place on success. |
+| **Req D: Escalation History** | `EscalationHistory.tsx`, `useTicketEscalations.ts` | Fetches `GET /api/tickets/{id}/escalations` newest-first. Renders before/after priority transitions, resolved agent names (or "Unassigned"), formatted due dates (or "No due date"), reason, actor, and formatted timestamps. Includes loading, error, and empty states. |
+| **Req E: Creation Triage Result** | `CreateTicketPage.tsx` | Post-creation confirmation card displaying structured triage decision: applied priority + reason, calculated SLA due date + reason, assigned agent + reason (or unassigned explanation). |
+| **Req F: Escalation Availability** | `EscalationPanel.tsx` | Disables/hides escalation controls when ticket is Critical, Resolved, or Closed with explanatory messages. Robustly handles server-side 409 responses for stale UI states. |
+| **Req G: Strict Type Safety** | `apps/web/src/types/api.ts` | Fully typed models matching backend DTOs (`TicketTriage`, `TicketEscalation`, `EscalateTicketPayload`, `EscalationResponse`). Strictly zero `any` and zero `@ts-ignore` across all touched code and test files. |
+
+### Architecture & Design Decisions
+
+- **Single Reusable SLA Component**: `SlaIndicator` standardizes SLA badge rendering across both list rows (`SlaCell`) and the detail panel (`TicketSummary`), ensuring visual consistency and centralized accessibility attributes.
+- **Backend-Driven Filtering & Pagination**: The SLA filter passes directly through `buildQuery` as `slaStatus` to the backend SQL query, letting SQL Server compute accurate filtered totals and pagination slices without in-memory evaluation.
+- **In-Place Reactive Refresh**: Successful escalation invokes `setData(response.ticket)` and `escalations.reload()`, updating priority, due date, SLA badge, and escalation history without full-page reloads.
+- **Accessibility & Contrast**: Badges combine distinct tones with textual status and symbols (`✓ Within SLA`, `⏳ At risk`, `✕ Breached`, `★ Met`, `— No SLA`), satisfying WCAG requirements where color is not the sole information channel.
+
+### Verification & Testing Summary
+
+1. **Vitest Unit & Integration Tests (`apps/web`)**: 41 passed, 0 failed across 9 test files.
+   - `SlaIndicator.test.tsx` (5 tests): Verifies all 5 statuses, visible text, accessibility labels, and badge tone classes.
+   - `useTicketList.test.ts` (7 tests): Debounce behavior, immediate non-search filter updates, pagination reset to page 1 on `slaStatus` change, and multi-filter combination.
+   - `TicketFilters.test.tsx` (4 tests): Dropdown rendering, friendly labels, selection callback, clearing callback (undefined), and filter combination.
+   - `EscalationPanel.test.tsx` (11 tests): Client-side length validation (5-500 chars), missing actor validation, pending state and double-click prevention, HTTP 400/404/409 error rendering, network failure handling, and Critical/Resolved/Closed availability rules.
+   - `EscalationHistory.test.tsx` (4 tests): Loading spinner, error retry callback, empty history notice, and before/after transition display with null agent/date handling.
+   - `CreateTicketPage.test.tsx` (3 tests): Assigned ticket triage decision display, unassigned explanation display, and reset flow.
+   - `TicketDetailPage.test.tsx` (2 tests): Detail rendering and post-escalation refresh without full page reload.
+   - `api/tickets.test.ts` (4 tests): Query parameter serialization and HTTP endpoint contracts.
+   - `TicketTable.test.tsx` (1 test): List table row rendering with SLA status.
+2. **TypeScript Compilation (`tsc -b --noEmit`)**: 0 errors.
+3. **ESLint (`eslint .`)**: 0 errors, 0 warnings.
+4. **Vite Production Bundle (`npm run build`)**: Succeeded cleanly (built in 710ms).
+
+---
+
+## Task 2.4: Comprehensive Automated Test Suite
+
+### 1. Requirements & Gap Analysis
+Based on the Task 2 inspection report, comprehensive unit, policy, and integration test coverage was implemented across the backend and frontend to verify all business rules (BR-1 through BR-8), database translation, and UI invariants without touching production code.
+
+### 2. Implementation & Test Architecture
+
+#### Backend Unit & Integration Tests (xUnit, Moq, EF Core)
+- **SLA Windows & Multipliers (`SlaCalculatorTests.cs`)**:
+  - Theory matrix across all 4 priorities (`Low`, `Medium`, `High`, `Critical`) for Standard (72h, 24h, 8h, 4h) and Premium (36h, 12h, 4h, 2h).
+  - Custom `MinimumWindowHours` floor enforcement (1h and 3h floor boundaries).
+  - Rejection of null `SlaOptions` via `ArgumentNullException`.
+- **Forced-Critical Category Behavior (`PriorityPolicyTests.cs`, `RaiseTicketCommandHandlerTests.cs`)**:
+  - Category flag `ForcesCriticalPriority` overrides requested priority (`Low`, `Medium`, `High`, `Critical`, or `null`).
+  - Command handler confirms SLA due date is derived from the Critical base window (4h standard / 2h premium) even if caller requested Low priority.
+- **Agent Workload & Assignment Policies (`AgentAssignmentPolicyTests.cs`)**:
+  - Fewest open ticket selection with deterministic tie-breaking by `Agent.Id` ascending.
+  - Specialist qualification requirement filtering (`RequiresSpecialist`).
+  - Capacity ceiling exclusion (`openTicketCount >= maxOpenTickets`) and inactive agent exclusion.
+  - Distinct explanatory failure reasons: empty pool, all inactive, all at capacity, or all specialists at capacity.
+  - Escalation re-evaluation (`ReevaluateAgentForEscalation`): owner retention when eligible, reassignment when inactive, reassignment when over-capacity or losing required specialization, and initial unassigned fallback.
+- **Ticket Escalation Lifecycle (`TicketEscalationTests.cs`, `EscalateTicketCommandHandlerTests.cs`)**:
+  - One-step priority escalation (`Low -> Medium -> High -> Critical`).
+  - Multiple sequential escalations maintaining chronological audit trails.
+  - Recalculation of SLA due date strictly from the injected current time (`FixedClock`), verified after clock advancement.
+  - Accurate escalation audit trail persistence (`FromPriority`, `ToPriority`, `FromAgentId`, `ToAgentId`, `FromDueAtUtc`, `ToDueAtUtc`, `Reason`, `EscalatedBy`, `EscalatedAtUtc`).
+  - Invariant rejections: Already Critical (409), Resolved/Closed (409), Missing ticket (404), reason length boundary validation (exact 5 and 500 chars valid; 4 and 501 chars rejected).
+- **SLA Exact Boundary Evaluation (`SlaEvaluatorTests.cs`)**:
+  - `NotApplicable`: Null due date (both unresolved and resolved).
+  - `Met`: Resolution on or before exact due date (`resolvedAtUtc <= dueAtUtc`).
+  - `Breached`: Resolution 1 tick / 1 second late; unresolved 1 tick / 1 second past due.
+  - `AtRisk`: Unresolved at exact due date; unresolved at exact 25.0% remaining window; unresolved with $< 25\%$ remaining.
+  - `WithinSla`: Unresolved with $> 25\%$ remaining (e.g. 250.001s / 1000s); zero or negative window duration before due date.
+- **SLA Filtering & SQL Translation (`TicketQueriesTests.cs`, `SqlServerSlaQueryTests.cs`)**:
+  - Verified on in-memory SQLite and live Microsoft SQL Server (`localhost:1433`).
+  - Covers `WithinSla`, `AtRisk`, `Breached`, `Met`, `NotApplicable`, and combined filters.
+  - Proves that the SQL Server `DateTime.Ticks` translation defect (HTTP 500) is permanently resolved via provider-aware `EF.Functions.DateDiffSecond` translation.
+
+#### Frontend Tests (Vitest, React Testing Library)
+- **Client-Side Escalation Reason Validation (`EscalationPanel.test.tsx`, `TicketDetailPage.test.tsx`)**:
+  - Reason $< 5$ characters (e.g. `"help"`) displays client-side validation message and blocks `ticketsApi.escalate`.
+  - Empty and whitespace-only reasons are rejected client-side without API calls.
+- **HTTP 409 Conflict Handling & Ticket Integrity (`EscalationPanel.test.tsx`, `TicketDetailPage.test.tsx`)**:
+  - When server returns HTTP 409, error banner is clearly displayed with `role="alert"`.
+  - Proves `onEscalated` callback is not called.
+  - Proves ticket priority badge in summary remains unchanged (remains `Medium` and does not become `High`).
+  - Proves escalation history on page does not add false records.
+- **SLA Indicator Accessibility & Distinct States (`SlaIndicator.test.tsx`)**:
+  - All 5 states (`WithinSla`, `AtRisk`, `Breached`, `Met`, `NotApplicable`) tested.
+  - Verified that every state provides unique visible text (`Within SLA`, `At risk`, `Breached`, `Met`, `No SLA`) and unique `aria-label` attribute (`SLA status: ...`).
+  - Verified each state uses distinct tone classes (`badge--info`, `badge--warning`, `badge--danger`, `badge--success`, `badge--neutral`), proving states do not rely on color alone.
+
+### 3. Verification Results Summary
+- **Backend Unit Tests (`SupportDesk.UnitTests`)**: 153 passed, 0 failed, 0 skipped.
+- **Architecture Tests (`SupportDesk.ArchitectureTests`)**: 4 passed, 0 failed.
+- **Frontend Tests (`apps/web`)**: 44 passed across 9 test files.
+- **TypeScript Typecheck (`tsc -b --noEmit`)**: 0 errors.
+- **ESLint (`eslint .`)**: 0 errors, 0 warnings.
+
+---
+
+## Task 2.5: Optional Stretch — SLA Summary Report
+
+### 1. Precondition & Dependency Gate
+Per `ASSIGNMENT_CANDIDATE.md` Section 2.5:
+> *"Only if Tasks 1-3 are finished and tested. GET /api/reports/sla-summary?from=&to=&groupBy=agent|priority returning, per group: total, breached, at risk, within, met, breach rate and average resolution hours. Must be a single database-side aggregation."*
+
+Because **Task 3 (Login and Authentication)** is required prior to stretch feature implementation, full code implementation is gated until Task 3 is finished and tested. Complete architecture and single-database aggregation designs are detailed in [SLA_SUMMARY_REPORT_DESIGN.md](file:///c:/Users/shaki/Desktop/northwind-support/SLA_SUMMARY_REPORT_DESIGN.md).
+
+### 2. Architectural Highlights
+- **Single Database-Side Aggregation**: All metrics (`total`, `breached`, `atRisk`, `within`, `met`, `breachRate`, `averageResolutionHours`) execute in a single SQL Server `GROUP BY` query with conditional aggregation (`COUNT(CASE WHEN ...)` and `AVG(...)`).
+- **Zero Client-Side Evaluation**: No in-memory filtering or grouping in C#; database engine computes aggregates before returning narrow DTO projections.
+- **SQL Server Translatability**: Employs `EF.Functions.DateDiffSecond` to ensure smooth T-SQL translation without client-side evaluation warnings.
+
+

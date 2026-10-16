@@ -158,4 +158,54 @@ describe('useTicketList', () => {
       expect.objectContaining({ status: undefined, search: '', page: 1 }),
     );
   });
+
+  it('refetches immediately when slaStatus changes and resets page to 1', async () => {
+    const { result } = renderHook(() => useTicketList());
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(getTickets).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      result.current.updateFilters({ page: 3 });
+    });
+
+    expect(getTickets).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      result.current.updateFilters({ slaStatus: 'AtRisk' });
+    });
+
+    expect(getTickets).toHaveBeenCalledTimes(3);
+    expect(getTickets).toHaveBeenLastCalledWith(
+      expect.objectContaining({ slaStatus: 'AtRisk', page: 1 }),
+    );
+  });
+
+  it('combines slaStatus with other filters and preserves them when clearing slaStatus', async () => {
+    const { result } = renderHook(() => useTicketList());
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      result.current.updateFilters({ priority: 'High', slaStatus: 'Breached' });
+    });
+
+    expect(getTickets).toHaveBeenLastCalledWith(
+      expect.objectContaining({ priority: 'High', slaStatus: 'Breached', page: 1 }),
+    );
+
+    // Clear slaStatus
+    await act(async () => {
+      result.current.updateFilters({ slaStatus: undefined });
+    });
+
+    expect(getTickets).toHaveBeenLastCalledWith(
+      expect.objectContaining({ priority: 'High', slaStatus: undefined, page: 1 }),
+    );
+  });
 });

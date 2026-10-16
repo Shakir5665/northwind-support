@@ -13,6 +13,8 @@ namespace SupportDesk.Domain.Aggregates.Tickets;
 /// </remarks>
 public sealed class Ticket : AggregateRoot
 {
+    private readonly List<TicketEscalation> _escalations = [];
+
     private Ticket()
     {
         // For EF Core.
@@ -48,9 +50,11 @@ public sealed class Ticket : AggregateRoot
     /// <summary>True while the ticket still needs work from an agent.</summary>
     public bool IsOpen => Status is not (TicketStatus.Resolved or TicketStatus.Closed);
 
+    /// <summary>History of escalations performed on this ticket.</summary>
+    public IReadOnlyCollection<TicketEscalation> Escalations => _escalations;
+
     /// <summary>
-    /// Raises a new ticket for a customer. It starts as <see cref="TicketStatus.New"/>, with no
-    /// owner and no due date.
+    /// Raises a new ticket for a customer. It starts as <see cref="TicketStatus.New"/>.
     /// </summary>
     public static Ticket Raise(
         string reference,
@@ -59,7 +63,9 @@ public sealed class Ticket : AggregateRoot
         int customerId,
         int categoryId,
         TicketPriority priority,
-        DateTime nowUtc)
+        DateTime nowUtc,
+        DateTime? dueAtUtc = null,
+        int? assignedAgentId = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(reference);
         ArgumentException.ThrowIfNullOrWhiteSpace(title);
@@ -75,7 +81,9 @@ public sealed class Ticket : AggregateRoot
             Priority = priority,
             Status = TicketStatus.New,
             CreatedAtUtc = nowUtc,
-            UpdatedAtUtc = nowUtc
+            UpdatedAtUtc = nowUtc,
+            DueAtUtc = dueAtUtc,
+            AssignedAgentId = assignedAgentId
         };
     }
 
@@ -110,5 +118,64 @@ public sealed class Ticket : AggregateRoot
     {
         AssignedAgentId = agentId;
         UpdatedAtUtc = nowUtc;
+    }
+
+    /// <summary>
+    /// Escalates the ticket (BR-7). Raises priority, updates due date and assigned agent,
+    /// and records an immutable escalation history row.
+    /// </summary>
+    /// <exception cref="BusinessRuleViolationException">The ticket is Critical, Resolved, or Closed.</exception>
+    public TicketEscalation Escalate(
+        TicketPriority newPriority,
+        DateTime newDueAtUtc,
+        int? newAssignedAgentId,
+        string reason,
+        string escalatedBy,
+        DateTime nowUtc)
+    {
+        if (Status is TicketStatus.Resolved or TicketStatus.Closed)
+        {
+            throw new BusinessRuleViolationException(
+                $"Ticket {Reference} is {Status} and cannot be escalated.");
+        }
+
+        if (Priority == TicketPriority.Critical)
+        {
+            throw new BusinessRuleViolationException(
+                $"Ticket {Reference} is already at Critical priority and cannot be escalated.");
+        }
+
+        if (string.IsNullOrWhiteSpace(reason) || reason.Trim().Length < 5 || reason.Trim().Length > 500)
+        {
+            throw new BusinessRuleViolationException(
+                "Escalation reason must be between 5 and 500 characters.");
+        }
+
+        if (string.IsNullOrWhiteSpace(escalatedBy))
+        {
+            throw new BusinessRuleViolationException(
+                "EscalatedBy is required.");
+        }
+
+        var escalation = new TicketEscalation(
+            Id,
+            Priority,
+            newPriority,
+            AssignedAgentId,
+            newAssignedAgentId,
+            DueAtUtc,
+            newDueAtUtc,
+            reason,
+            escalatedBy,
+            nowUtc);
+
+        _escalations.Add(escalation);
+
+        Priority = newPriority;
+        DueAtUtc = newDueAtUtc;
+        AssignedAgentId = newAssignedAgentId;
+        UpdatedAtUtc = nowUtc;
+
+        return escalation;
     }
 }
