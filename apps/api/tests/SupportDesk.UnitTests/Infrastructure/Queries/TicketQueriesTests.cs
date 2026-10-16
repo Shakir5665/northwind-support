@@ -330,4 +330,147 @@ public sealed class TicketQueriesTests : IDisposable
             Assert.Contains("Priority", cmd);
         });
     }
+
+    [Fact]
+    public async Task GetEscalationsAsync_TicketDoesNotExist_ReturnsNull()
+    {
+        var result = await _sut.GetEscalationsAsync(9999, CancellationToken.None);
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public async Task GetEscalationsAsync_TicketExistsWithNoEscalations_ReturnsEmptyList()
+    {
+        var result = await _sut.GetEscalationsAsync(1, CancellationToken.None);
+        Assert.NotNull(result);
+        Assert.Empty(result);
+    }
+
+    [Fact]
+    public async Task GetEscalationsAsync_ReturnsNewestFirstAndIsolatesTickets()
+    {
+        var now = FixedClock.DefaultNow;
+        var t1 = await _db.Set<Ticket>().FindAsync(1);
+        var t3 = await _db.Set<Ticket>().FindAsync(3);
+
+        // Add 1 escalation to Ticket 1 (High -> Critical)
+        var esc1 = t1!.Escalate(TicketPriority.Critical, now.AddHours(4), _agent1.Id, "Reason One", "Lead Bob", now.AddMinutes(-30));
+
+        // Add 2 escalations to Ticket 3 (Low -> Medium -> High)
+        var esc2 = t3!.Escalate(TicketPriority.Medium, now.AddHours(20), _agent1.Id, "Reason Two", "Lead Alice", now.AddMinutes(-20));
+        var esc3 = t3.Escalate(TicketPriority.High, now.AddHours(10), _agent2.Id, "Reason Three", "Lead Charlie", now.AddMinutes(-10));
+
+        await _db.SaveChangesAsync();
+
+        var result = await _sut.GetEscalationsAsync(3, CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.Equal(2, result.Count);
+        // Newest first: esc3 was at -10min, esc2 was at -20min
+        Assert.Equal("Reason Three", result[0].Reason);
+        Assert.Equal("Lead Charlie", result[0].EscalatedBy);
+        Assert.Equal("Reason Two", result[1].Reason);
+        Assert.Equal("Lead Alice", result[1].EscalatedBy);
+
+        // Verify ticket 1's escalation was not included
+        Assert.DoesNotContain(result, e => e.Reason == "Reason One");
+    }
+
+    [Fact]
+    public async Task GetPagedAsync_FilterBySlaStatus_NotApplicable()
+    {
+        // t1 has DueAtUtc = null in seed data
+        var result = await _sut.GetPagedAsync(new TicketQuery { SlaStatus = SlaStatus.NotApplicable }, CancellationToken.None);
+
+        Assert.All(result.Items, item => Assert.Equal(SlaStatus.NotApplicable, item.SlaStatus));
+        Assert.Equal(result.TotalCount, result.Items.Count);
+    }
+
+    [Fact]
+    public async Task GetPagedAsync_FilterBySlaStatus_Met()
+    {
+        var now = FixedClock.DefaultNow;
+        var tMet = Ticket.Raise("TCK-MET", "Resolved on time", "Desc", _customer1.Id, _category1.Id, TicketPriority.Medium, now.AddHours(-5), now.AddHours(-1), null);
+        tMet.ChangeStatus(TicketStatus.Resolved, now.AddHours(-2)); // Resolved 1 hr before due
+
+        _db.Add(tMet);
+        await _db.SaveChangesAsync();
+
+        var result = await _sut.GetPagedAsync(new TicketQuery { SlaStatus = SlaStatus.Met }, CancellationToken.None);
+
+        Assert.Contains(result.Items, item => item.Reference == "TCK-MET");
+        Assert.All(result.Items, item => Assert.Equal(SlaStatus.Met, item.SlaStatus));
+    }
+
+    [Fact]
+    public async Task GetPagedAsync_FilterBySlaStatus_Breached()
+    {
+        var now = FixedClock.DefaultNow;
+        // Unresolved and past due
+        var tLate = Ticket.Raise("TCK-LATE", "Past due", "Desc", _customer1.Id, _category1.Id, TicketPriority.High, now.AddHours(-10), now.AddHours(-1), null);
+        _db.Add(tLate);
+        await _db.SaveChangesAsync();
+
+        var result = await _sut.GetPagedAsync(new TicketQuery { SlaStatus = SlaStatus.Breached }, CancellationToken.None);
+
+        Assert.Contains(result.Items, item => item.Reference == "TCK-LATE");
+        Assert.All(result.Items, item => Assert.Equal(SlaStatus.Breached, item.SlaStatus));
+    }
+
+    [Fact]
+    public async Task GetPagedAsync_FilterBySlaStatus_AtRisk()
+    {
+        var now = FixedClock.DefaultNow;
+        // Created 3h ago, due in 1h. Window = 4h. Remaining = 1h (25% remaining) -> AtRisk
+        var tAtRisk = Ticket.Raise("TCK-ATRISK", "Almost late", "Desc", _customer1.Id, _category1.Id, TicketPriority.Medium, now.AddHours(-3), now.AddHours(1), null);
+        _db.Add(tAtRisk);
+        await _db.SaveChangesAsync();
+
+        var result = await _sut.GetPagedAsync(new TicketQuery { SlaStatus = SlaStatus.AtRisk }, CancellationToken.None);
+
+        Assert.Contains(result.Items, item => item.Reference == "TCK-ATRISK");
+        Assert.All(result.Items, item => Assert.Equal(SlaStatus.AtRisk, item.SlaStatus));
+    }
+
+    [Fact]
+    public async Task GetPagedAsync_FilterBySlaStatus_WithinSla()
+    {
+        var now = FixedClock.DefaultNow;
+        // Created 1h ago, due in 3h. Window = 4h. Remaining = 3h (75% remaining) -> WithinSla
+        var tWithin = Ticket.Raise("TCK-WITHIN", "Plenty of time", "Desc", _customer1.Id, _category1.Id, TicketPriority.Low, now.AddHours(-1), now.AddHours(3), null);
+        _db.Add(tWithin);
+        await _db.SaveChangesAsync();
+
+        var result = await _sut.GetPagedAsync(new TicketQuery { SlaStatus = SlaStatus.WithinSla }, CancellationToken.None);
+
+        Assert.Contains(result.Items, item => item.Reference == "TCK-WITHIN");
+        Assert.All(result.Items, item => Assert.Equal(SlaStatus.WithinSla, item.SlaStatus));
+    }
+
+    [Fact]
+    public async Task GetPagedAsync_SlaStatusCombinedWithOtherFiltersAndPaging()
+    {
+        var now = FixedClock.DefaultNow;
+        var tHighLate1 = Ticket.Raise("TCK-HL1", "High late 1", "Desc", _customer1.Id, _category1.Id, TicketPriority.High, now.AddHours(-10), now.AddHours(-2), null);
+        var tHighLate2 = Ticket.Raise("TCK-HL2", "High late 2", "Desc", _customer1.Id, _category1.Id, TicketPriority.High, now.AddHours(-8), now.AddHours(-1), null);
+        var tLowLate = Ticket.Raise("TCK-LL", "Low late", "Desc", _customer1.Id, _category1.Id, TicketPriority.Low, now.AddHours(-8), now.AddHours(-1), null);
+
+        _db.AddRange(tHighLate1, tHighLate2, tLowLate);
+        await _db.SaveChangesAsync();
+
+        var query = new TicketQuery
+        {
+            SlaStatus = SlaStatus.Breached,
+            Priority = TicketPriority.High,
+            Page = 1,
+            PageSize = 1
+        };
+
+        var result = await _sut.GetPagedAsync(query, CancellationToken.None);
+
+        Assert.Equal(2, result.TotalCount);
+        Assert.Single(result.Items);
+        Assert.Equal(TicketPriority.High, result.Items[0].Priority);
+        Assert.Equal(SlaStatus.Breached, result.Items[0].SlaStatus);
+    }
 }
