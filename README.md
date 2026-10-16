@@ -100,6 +100,15 @@ Implemented complete domain rules (**BR-1 through BR-8**):
 - **Rejected**: Baking HTTPS certificates or `.env` secrets into the Docker image.
 - **Why**: Violates Twelve-Factor App principles and leaks secrets to image registries. Production environments terminate TLS at ingress/reverse proxies.
 
+#### H. Design Patterns Applied & Justified
+Three patterns were chosen that genuinely fit the domain without unnecessary complexity:
+1. **Strategy / Domain Policy Pattern** (`PriorityPolicy`, `SlaCalculator`, `AgentAssignmentPolicy`, `SlaEvaluator`):
+   - *Justification*: Encapsulates individual business rules into pure, stateless strategies. This enables the exact same assignment and SLA logic to be reused across both initial creation triage and subsequent escalation workflows while remaining independently testable with simulated clocks (`FixedClock`).
+2. **Aggregate Root Pattern (DDD)** (`Ticket` aggregate):
+   - *Justification*: `Ticket` encapsulates its escalation history (`TicketEscalations`) and controls all lifecycle state mutations. Invariant rules (e.g. rejecting escalation of Critical, Resolved, or Closed tickets, validating reason length) are guarded by domain methods, ensuring the database transaction never commits an invalid ticket state.
+3. **Repository & Query Separation (CQRS-lite)** (`IUnitOfWork`, `TicketQueries`):
+   - *Justification*: State mutations execute through aggregate repositories committed within an atomic unit of work transaction, whereas read-heavy ticket listings execute through `TicketQueries` with database-level `IQueryable` projections, `AsNoTracking`, and SQL paging, maximizing read throughput and avoiding object graph hydration overhead.
+
 ---
 
 ### 3. The defect: root cause, fix, how to verify
