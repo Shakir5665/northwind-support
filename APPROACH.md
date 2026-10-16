@@ -288,4 +288,80 @@ Because **Task 3 (Login and Authentication)** is required prior to stretch featu
 - **Zero Client-Side Evaluation**: No in-memory filtering or grouping in C#; database engine computes aggregates before returning narrow DTO projections.
 - **SQL Server Translatability**: Employs `EF.Functions.DateDiffSecond` to ensure smooth T-SQL translation without client-side evaluation warnings.
 
+---
+
+## Task 3: Backend Login and Authentication
+
+### Task 3.1: Backend Authentication Architecture
+
+#### 1. Credential Storage: Direct on `Agent` Aggregate
+- **Design Decision**: `PasswordHash` is stored directly as a nullable column (`nvarchar(500)`) on the existing `Agent` domain aggregate, accessed via domain method `SetPasswordHash(string passwordHash)`.
+- **Reasoning**:
+  - The current domain model represents support desk users 1:1 as `Agent` entities.
+  - Adding `PasswordHash` directly to `Agent` avoids unnecessary table joins, additional foreign keys, or a detached identity aggregate for what is fundamentally a single domain entity.
+  - It maintains aggregate encapsulation: only the domain method `SetPasswordHash` can mutate the hash, preventing external corruption.
+- **Alternatives Considered & Rejected**:
+  - *Separate `AgentCredential` table / entity*: Would add a 1:1 join on every login without domain benefit at this stage. It would over-engineer the schema ahead of requirements for multi-credential types or complex auth schemes.
+  - *Full ASP.NET Core Identity DB context*: Demands extensive boilerplate tables (`AspNetUsers`, `AspNetRoles`, `AspNetUserClaims`, etc.) that are redundant given the simple support agent identity model and strict monorepo constraints.
+
+#### 2. Vetted Password Hashing: ASP.NET Core Identity `PasswordHasher<string>`
+- **Design Decision**: Implemented `IPasswordHasher` abstraction in the Application layer, backed by `Microsoft.AspNetCore.Identity.PasswordHasher<string>` in Presentation/Security (`AspNetPasswordHasher`).
+- **Reasoning**:
+  - ASP.NET Core Identity's `PasswordHasher` is an industry-standard, battle-tested cryptographic implementation conforming to RFC 2898.
+  - Uses PBKDF2 with HMAC-SHA512, 100,000 iterations, and a cryptographically secure 128-bit per-hash random salt.
+  - Generates self-describing, versioned byte payloads (`0x01` header format) allowing transparent algorithm upgrades in future versions without breaking legacy hashes.
+  - Reversible encryption and naive hashing (such as MD5/SHA256 without salts and stretching) were strictly avoided.
+  - The `IPasswordHasher` interface in `SupportDesk.Application.Abstractions` prevents the Application and Domain layers from taking direct dependencies on ASP.NET Core libraries, preserving Clean Architecture layer independence.
+
+#### 3. Stateless JWT Authentication Flow
+- **Design Decision**: Signed JSON Web Tokens (HMAC-SHA256) issued via `POST /api/auth/login` and validated by ASP.NET Core JWT Bearer authentication middleware.
+- **Claim Design**:
+  - `ClaimTypes.NameIdentifier`: Agent's `Guid` ID.
+  - `ClaimTypes.Name`: Agent's `FullName`.
+  - `ClaimTypes.Email`: Agent's `Email`.
+  - Standard JWT claims: `sub`, `jti`, `iat`, `nbf`, `exp`, `iss`, `aud`.
+- **Reasoning**:
+  - Tokens are stateless and self-contained, requiring zero server-side session state or database lookups per authenticated request.
+  - Configurable expiration (defaulting to 30 minutes) limits the attack window of token compromise without needing complex server-side session stores.
+  - Clear startup validation: `JwtOptions` validates that `SigningKey` is present and at least 32 characters (256 bits), throwing `InvalidOperationException` immediately upon application boot if invalid or missing.
+
+#### 4. Centralized Fallback Authorization Policy
+- **Design Decision**: Implemented a global fallback authorization policy (`FallbackPolicy = new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build()`) in `Program.cs`.
+- **Reasoning**:
+  - **Secure by Default**: Every endpoint in the entire API requires authentication unless explicitly decorated with `[AllowAnonymous]`.
+  - Eliminates the risk of developers forgetting `[Authorize]` attributes when adding new controllers or actions.
+  - Only `POST /api/auth/login` and OpenAPI/Swagger specifications are exempted with `[AllowAnonymous]`.
+  - All existing ticket endpoints (`GET /api/tickets`, `POST /api/tickets/{id}/escalate`, triage, escalation history) and future endpoints are automatically protected without modifying existing controller classes.
+  - Middleware order strictly ensures `UseAuthentication()` runs before `UseAuthorization()`.
+
+#### 5. Escalation Attribution Security
+- **Design Decision**: Updated `EscalateTicketCommandHandler` to inject `ICurrentUser` and record the authenticated agent's name (`currentUser.FullName`) into `EscalatedBy`, ignoring any forged caller-provided `escalatedBy` in the request body.
+- **Reasoning**:
+  - In a secure system, audit attribution must come from trusted authentication context (the validated JWT claims), never from untrusted client input.
+  - If an unauthenticated or test context invokes the command without a user, it safely falls back to a default system identity.
+  - Preserves full audit trail integrity and prevents agents from impersonating colleagues or team leads in escalation histories.
+
+#### 6. Safe Development Fixture Seeding
+- **Design Decision**: `SupportDbSeeder` seeds password hashes for known test agents (`sarah.chen@northwind.local`, `marcus.vance@northwind.local`, etc.) with `DevPassword123!`.
+- **Security Safeguards**:
+  - **Environment Gated**: Seeding of dev credentials only executes when `Environment.IsDevelopment()` is true; production environments never seed default passwords.
+  - **Hash at Seed Time**: The password is never stored or committed in plaintext; it is passed through `IPasswordHasher` during seed execution.
+  - **Idempotency & Non-Destructive**: For existing databases, `SupportDbSeeder` checks each agent and only sets `PasswordHash` if it is currently `null` or empty (`string.IsNullOrWhiteSpace(a.PasswordHash)`). Existing or modified credentials are never overwritten on startup.
+
+#### 7. Key Trade-offs & Known Limitations
+- **Trade-offs**:
+  - *Direct Model vs. Identity DB*: Modifying the `Agent` table is simpler and perfectly suited for this application, but tightens the coupling between agent management and authentication.
+  - *Stateless JWT vs. Stateful Sessions*: Stateless tokens cannot be revoked individually before expiration without maintaining a token revocation list/blocklist in cache. A short lifetime (30 minutes) mitigates this risk.
+  - *Fallback Policy vs. Explicit `[Authorize]`*: Fallback policy protects the entire API footprint automatically, but requires developers to be conscious of adding `[AllowAnonymous]` when creating public endpoints.
+- **Explicit Known Limitations (Out of Scope)**:
+  - **User Registration**: Not implemented; agents are provisioned via administrative seeding.
+  - **Password Reset / Recovery**: No forgot password or email reset workflows.
+  - **Email Verification**: Agent emails are assumed valid.
+  - **OAuth / SSO / OpenID Connect**: External identity providers (Google, Microsoft Entra ID) are not integrated.
+  - **Refresh Tokens / Sliding Sessions**: When tokens expire after 30 minutes, users must log in again.
+  - **Multi-Factor Authentication (MFA / 2FA)**: Single-factor password authentication only.
+  - **Account Lockout**: No tracking of failed login attempts or lockout periods.
+  - **Rate Limiting / Brute-force Protection**: No throttling on `POST /api/auth/login`.
+
+
 

@@ -39,8 +39,18 @@ public sealed class Agent : AggregateRoot
 
     public DateTime CreatedAtUtc { get; private set; }
 
+    /// <summary>Hashed password for agent authentication.</summary>
+    public string? PasswordHash { get; private set; }
+
     /// <summary>The ticket categories this agent is qualified for.</summary>
     public IReadOnlyCollection<AgentSpecialization> Specializations => _specializations;
+
+    /// <summary>Sets the hashed credentials for this agent.</summary>
+    public void SetPasswordHash(string passwordHash)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(passwordHash);
+        PasswordHash = passwordHash;
+    }
 
     /// <summary>Records that the agent is qualified for a category. Adding one twice is a no-op.</summary>
     public void AddSpecialization(int categoryId)

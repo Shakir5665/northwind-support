@@ -254,6 +254,139 @@ The complete endpoint specification, single SQL query architecture, and EF Core 
 
 ---
 
+## Task 3: Backend Login and Authentication (Task 3.1)
+
+### Authentication Overview
+The Northwind Support Desk backend is secured using signed JSON Web Tokens (JWT) and ASP.NET Core Bearer authentication with a centralized fallback authorization policy:
+- **Credentials Storage**: A nullable `PasswordHash` column (`nvarchar(500) NULL`) was added directly to the `Agents` table mapped through the `Agent` domain aggregate.
+- **Password Hashing**: Implements `IPasswordHasher` using ASP.NET Core Identity's vetted `PasswordHasher<string>` (PBKDF2 with HMAC-SHA512, cryptographically secure 128-bit per-hash salt, and versioned hashing). Plaintext passwords and reversible encryption are never stored.
+- **Centralized Endpoint Protection**: A fallback authorization policy (`options.FallbackPolicy = new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build()`) protects all application endpoints by default (`/api/tickets`, `/api/agents`, `/api/customers`, `/api/categories`, `/api/auth/me`). Only `POST /api/auth/login` (`[AllowAnonymous]`) and Swagger endpoints remain anonymous.
+- **Escalation Attribution**: `POST /api/tickets/{id}/escalate` extracts the escalating agent's identity directly from the validated JWT claims (`NameIdentifier`, `Name`, `Email`), ignoring any forged `escalatedBy` values provided in the request body.
+
+### Local Development Credentials & Security Note
+> [!CAUTION]
+> **Security Notice**: Development credentials are local fixtures only. They are seeded exclusively in local development environments and must **never** be used in production.
+
+- **Development Password**: `DevPassword123!`
+- **Seeded Active Agent (Default)**: `alex.turner@northwind-support.example`
+- **Other Seeded Active Agents**:
+  - `ben.osei@northwind-support.example`
+  - `priya.nair@northwind-support.example`
+  - `sara.lindqvist@northwind-support.example`
+  - `marcus.doyle@northwind-support.example`
+- **Seeded Inactive Agent**:
+  - `yuki.tanaka@northwind-support.example` (Deactivated; rejected with 401 on login)
+- **Seeder Idempotency & Safe Backfilling**: Credentials are generated and hashed at seed time using the same `IPasswordHasher`. Existing agent credentials are never overwritten on application startup. For existing databases with pre-existing tickets, unhashed agents are safely backfilled without resetting active credentials. Development seeding is gated under `app.Environment.IsDevelopment()`.
+
+### JWT Configuration & Environment Variables
+The JWT signing key is read from configuration or environment variables. No secret keys are hardcoded in source code or committed to git.
+
+- **Token Lifetime**: `30` minutes (reasonable balance between security and developer workflow).
+- **Validation**: Strict validation of cryptographic signature (`HmacSha256`), issuer, audience, and expiration lifetime with zero clock skew.
+- **Startup Guard**: The application strictly validates at startup that `Jwt:SigningKey` is present and at least 32 characters long (256 bits). If missing or invalid, startup fails immediately with a clear error:
+  ```
+  InvalidOperationException: JWT signing key is missing or invalid. Set 'Jwt:SigningKey' in configuration or 'Jwt__SigningKey' environment variable with at least 32 characters.
+  ```
+
+#### Required Environment Variables (`.env.example`)
+```env
+# --- JWT Authentication -----------------------------------------------------
+# Symmetric key used to sign and validate JWT tokens. Must be at least 32 characters (256 bits).
+# For production, generate a cryptographically strong random secret.
+Jwt__SigningKey=local-development-secret-key-at-least-32-chars-long!
+Jwt__Issuer=SupportDesk
+Jwt__Audience=SupportDeskClient
+Jwt__LifetimeMinutes=30
+```
+
+### Database Migration Instructions
+The database change adds `PasswordHash` to the `Agents` table via an EF Core migration:
+```bash
+# Generate the migration (already committed as AddAgentPasswordHash)
+npm run ef -- migrations add AddAgentPasswordHash -o Data/Migrations
+
+# Apply migrations to the local database
+npm run db:migrate
+```
+
+### API Contracts
+
+#### 1. Agent Login (`POST /api/auth/login`)
+Public endpoint (`[AllowAnonymous]`). Accepts email and password.
+
+**Request:**
+```http
+POST /api/auth/login HTTP/1.1
+Host: localhost:5043
+Content-Type: application/json
+
+{
+  "email": "alex.turner@northwind-support.example",
+  "password": "DevPassword123!"
+}
+```
+
+**Success Response (200 OK):**
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "expiresAtUtc": "2026-10-16T20:03:45.6559945Z",
+  "agentId": 1,
+  "name": "Alex Turner",
+  "email": "alex.turner@northwind-support.example"
+}
+```
+
+**Failure Response (401 Unauthorized):**
+An unknown email, incorrect password, or inactive agent returns an identical generic 401 response:
+```http
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json; charset=utf-8
+
+{
+  "title": "Unauthorized",
+  "status": 401,
+  "detail": "Invalid email or password."
+}
+```
+
+#### 2. Current User Profile (`GET /api/auth/me`)
+Protected endpoint. Returns agent identity from validated JWT claims.
+
+**Request:**
+```http
+GET /api/auth/me HTTP/1.1
+Host: localhost:5043
+Authorization: Bearer <token>
+```
+
+**Success Response (200 OK):**
+```json
+{
+  "agentId": 1,
+  "name": "Alex Turner",
+  "email": "alex.turner@northwind-support.example"
+}
+```
+
+**Unauthenticated Response (401 Unauthorized):**
+Requests without a valid token receive `401 Unauthorized`.
+
+#### 3. Calling Protected Endpoints
+All existing application endpoints (`GET /api/tickets`, `POST /api/tickets`, `POST /api/tickets/{id}/escalate`, etc.) require a valid Bearer token in the `Authorization` header:
+
+```bash
+curl -X GET http://localhost:5043/api/tickets \
+  -H "Authorization: Bearer <token>"
+```
+
+Anonymous requests to any protected endpoint return `401 Unauthorized`. Login and Swagger are the only intended anonymous endpoints.
+
+---
+
 ## Quick start
 
 **Prerequisites:** .NET SDK 10 (`global.json`), Node.js 22 (`.nvmrc`; 20.19+ works), Docker.

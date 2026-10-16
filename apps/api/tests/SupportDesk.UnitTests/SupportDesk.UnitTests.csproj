@@ -13,10 +13,12 @@
     <ProjectReference Include="../../src/SupportDesk.Application/SupportDesk.Application.csproj" />
     <ProjectReference Include="../../src/SupportDesk.Domain/SupportDesk.Domain.csproj" />
     <ProjectReference Include="../../src/SupportDesk.Infrastructure/SupportDesk.Infrastructure.csproj" />
+    <ProjectReference Include="../../src/SupportDesk.Presentation/SupportDesk.Presentation.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="coverlet.collector" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
     <PackageReference Include="Moq" />
