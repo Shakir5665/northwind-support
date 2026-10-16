@@ -252,4 +252,15 @@ public class AuthEndpointIntegrationTests : IAsyncLifetime
             Environment.SetEnvironmentVariable("Jwt__SigningKey", JwtSecret);
         }
     }
+
+    [Fact]
+    public async Task HealthCheck_Returns200Ok_WithoutAuthentication()
+    {
+        var response = await _client.GetAsync("/health");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var content = await response.Content.ReadAsStringAsync();
+        Assert.Equal("Healthy", content);
+    }
 }
+

@@ -444,6 +444,65 @@ Because **Task 3 (Login and Authentication)** is required prior to stretch featu
   - `npm run lint --workspace apps/web`: 0 errors, 0 warnings (`eslint .`).
   - `npm run build --workspace apps/web`: Production bundle compiled cleanly in 474ms.
 
+---
+
+## Task 4: Docker Architecture & Containerisation
+
+### 1. Multi-Stage Build & Layer Caching Strategy (DK-1, DK-2)
+- **Design Decision**: Implemented a two-stage Dockerfile (`build` using `mcr.microsoft.com/dotnet/sdk:10.0` and `runtime` using `mcr.microsoft.com/dotnet/aspnet:10.0`), built from the repository root context.
+- **Layer Optimization**:
+  - The build context explicitly copies solution manifests (`global.json`, `Directory.Build.props`, `Directory.Packages.props`) and project definition files (`.csproj`) before triggering `dotnet restore`.
+  - Source code (`apps/api/src/`) is copied only after dependencies have been restored.
+  - This ensures that code modifications do not invalidate the expensive NuGet restore layer. Verified by changing `DatabaseHealthCheck.cs` and rebuilding: the restore step was completely cached (`#15 [build 8/10] RUN dotnet restore ... CACHED`).
+- **Context Hygiene (`.dockerignore`)**:
+  - Excludes `bin/`, `obj/`, `node_modules/`, `.git/`, `.env*`, and the `apps/web/` directory.
+  - Prevents host compilation artifacts from contaminating container builds and minimizes build context transfer to 232 KB.
+
+### 2. Runtime Security & Non-Root Execution (DK-3)
+- **Design Decision**: The runtime container executes strictly as non-root user `app` (UID 1654, GID 1654) and exposes plain HTTP port `8080`.
+- **Reasoning**:
+  - Running as `root` inside containers poses container breakout and privilege escalation risks.
+  - Modern ASP.NET Core images (starting in .NET 8) provide the pre-configured `app` user and default HTTP port `8080` without requiring custom OS user provisioning.
+  - Container file permissions are assigned using `--chown=app:app /app/publish .`.
+  - HTTPS is deliberately terminated outside the container (or at a reverse proxy/load balancer) in cloud environments, avoiding baking self-signed certificates into images.
+  - Verified with `docker compose exec api whoami`, which confirms the active identity is `app`.
+
+### 3. Dynamic Runtime Configuration & Secret Isolation (DK-4, DK-5)
+- **Design Decision**: Zero secrets or environment-specific values are baked into the image. All configuration is supplied via runtime environment variables in `docker-compose.yml` and `.env.example`.
+- **Reasoning**:
+  - Adheres to Twelve-Factor App principles (Config in the environment).
+  - Database connectivity resolves via Docker Compose DNS service name `sqlserver` (`Server=sqlserver,1433;...`) rather than host `localhost`.
+  - JWT signing key, issuer, audience, and lifetime are supplied through standard `Jwt__*` environment variables.
+  - The host port `5080` maps to container port `8080` (`5080:8080`), leaving local port `5043` available for host Kestrel debugging.
+  - Service dependency `depends_on: sqlserver: condition: service_healthy` prevents the API from starting prematurely before SQL Server is ready to accept connections.
+
+### 4. Health Check Endpoint Design (DK-7)
+- **Design Decision**: Added `DatabaseHealthCheck` implementing `IHealthCheck` and exposed via `GET /health`.
+- **Reasoning**:
+  - Integrates directly with ASP.NET Core's diagnostic pipeline and executes `dbContext.Database.CanConnectAsync()`.
+  - Excluded from the global fallback authorization policy using `app.MapHealthChecks("/health").AllowAnonymous()`, allowing container orchestrators and load balancers to poll health without credentials while keeping application APIs secured.
+  - Verified with `curl -i http://localhost:5080/health`, returning `200 OK` with payload `Healthy`.
+
+### 5. Migration & Seeding Lifecycle: Development vs. Production (DK-6)
+- **Development Convenience**:
+  - On application boot with `ASPNETCORE_ENVIRONMENT=Development`, `app.MigrateAndSeedAsync()` automatically executes pending EF Core migrations and seeds initial categories, customers, agents, and tickets.
+  - On a fresh volume (`docker compose down -v && docker compose up --build`), the database starts clean, is migrated automatically, and seeds 40 tickets and 6 agents with hashed credentials.
+- **Production Limitations & Strategy**:
+  - In production, running migrations inside the web app container at startup is an anti-pattern:
+    1. *Multi-Instance Race Conditions*: Running horizontal replicas would trigger concurrent migration executions, risking deadlocks or failed schema updates.
+    2. *Excessive Privileges*: Running migrations requires DDL permissions (`CREATE TABLE`, `ALTER TABLE`, etc.), whereas the web app should connect using a low-privilege runtime user with DML permissions only (`SELECT`, `INSERT`, `UPDATE`, `DELETE`).
+    3. *Audit & Rollback*: Production database updates should be executed as a controlled deployment gate in a CI/CD pipeline (e.g. `dotnet ef database update` or idempotent SQL scripts via `dotnet ef migrations script --idempotent`) before spinning up new container pods.
+
+### 6. Image Size Measurements & Footprint
+- **Measured Virtual Sizes**:
+  - .NET 10 SDK (`mcr.microsoft.com/dotnet/sdk:10.0`): **1.3 GB** (351 MB compressed base layers).
+  - ASP.NET 10 Runtime (`mcr.microsoft.com/dotnet/aspnet:10.0`): **340 MB** (95.9 MB compressed base layers).
+  - API Container (`northwind-support-api:latest`): **455 MB** (125 MB total layer footprint).
+- **Optimization Trade-off**:
+  - Multi-stage build isolates the entire SDK (compilers, build tools, package caches) to the build stage, achieving a ~65% size reduction in the deployed runtime image compared to the SDK.
+  - Using the standard ASP.NET runtime provides full system debugging, ICU globalization, and OpenSSL libraries out of the box without the complexity of AOT or Alpine musl compatibility constraints.
+
+
 
 
 

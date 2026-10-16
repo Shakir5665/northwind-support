@@ -84,6 +84,10 @@ builder.Services.AddAuthorization(options =>
         .Build();
 });
 
+// DK-7: Health check endpoint reporting API and database connectivity
+builder.Services.AddHealthChecks()
+    .AddCheck<SupportDesk.Presentation.Health.DatabaseHealthCheck>("database");
+
 builder.Services.AddApplication();
 builder.Services.AddInfrastructure(builder.Configuration);
 
@@ -105,8 +109,12 @@ app.UseCors(FrontendCorsPolicy);
 app.UseAuthentication();
 app.UseAuthorization();
 
+// DK-7: Anonymous health check endpoint
+app.MapHealthChecks("/health").AllowAnonymous();
+
 app.MapControllers();
 
 app.Run();
+
 
 public partial class Program { }

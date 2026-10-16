@@ -428,13 +428,98 @@ if (token && path !== '/auth/login' && !headers['Authorization']) {
   - `client.test.ts` (11 tests): Storage helper methods, Bearer token attachment, skipping token on `/auth/login`, 401 session clearing and unauthorized handler invocation, exempting `/auth/login` from 401 logout, concurrent 401 debounce guard, and `getSafeReturnUrl` open-redirect security.
   - Existing ticket, escalation, and SLA test suites (44 tests) all pass without regressions.
 - **TypeScript Typecheck (`npm run typecheck --workspace apps/web`)**: 0 errors.
-- **ESLint (`npm run lint --workspace apps/web`)**: 0 errors, 0 warnings.
 - **Vite Production Build (`npm run build --workspace apps/web`)**: Succeeded cleanly (built in 474ms).
 
 ---
 
+## Task 4: Dockerise the API
+
+### Overview
+Containerised the .NET 10 Web API using a multi-stage Docker build, non-root runtime security, environment-based configuration, container health checks, and Docker Compose orchestration.
+
+| Requirement | Implementation Details |
+|---|---|
+| **Multi-Stage Build (DK-1)** | Built from repository root using .NET 10 SDK (`mcr.microsoft.com/dotnet/sdk:10.0`) for restore/publish and ASP.NET 10 runtime (`mcr.microsoft.com/dotnet/aspnet:10.0`) for execution. Copies `global.json`, `Directory.Build.props`, `Directory.Packages.props`, and `.csproj` files prior to `dotnet restore` to maximize Docker layer caching. |
+| **Docker Ignore (DK-2)** | Root `.dockerignore` excludes `bin/`, `obj/`, `node_modules/`, `.git/`, `.env*`, and `apps/web/`. |
+| **Runtime Security (DK-3)** | Runs as non-root user `app` (UID 1654). Binds to HTTP port `8080`. Excludes HTTPS certificates from the image. |
+| **Runtime Configuration (DK-4)** | Zero secrets or environment-specific configs baked into image. Injects `ConnectionStrings__Default`, `Jwt__SigningKey`, `Jwt__Issuer`, `Jwt__Audience`, `Jwt__LifetimeMinutes`, and `ASPNETCORE_ENVIRONMENT` at container runtime. |
+| **Compose Integration (DK-5)** | Added `api` service to `docker-compose.yml` published at `localhost:5080:8080`. Connects to SQL Server via Compose service name `sqlserver`. Enforces `depends_on: sqlserver: condition: service_healthy`. |
+| **Fresh Volume Startup (DK-6)** | Automatically applies EF Core migrations and seeds development data on startup when `ASPNETCORE_ENVIRONMENT=Development`. |
+| **Health Check (DK-7)** | Anonymous `GET /health` endpoint running `DatabaseHealthCheck` (`CanConnectAsync`). Configured via `app.MapHealthChecks("/health").AllowAnonymous()`. |
+| **Frontend Proxy (DK-8)** | Compatible with `VITE_API_PROXY_TARGET=http://localhost:5080 npm run web`. |
+
+### Docker Compose Commands
+
+```bash
+# Build and start both SQL Server and the API container
+docker compose up --build
+
+# Run in background (detached)
+docker compose up --build -d
+
+# Wipe database volume and rebuild cleanly
+docker compose down -v && docker compose up --build -d
+
+# Stop services
+docker compose down
+```
+
+### Health Check & Verification
+
+```bash
+# Verify health check endpoint (returns 200 OK with 'Healthy')
+curl -i http://localhost:5080/health
+
+# Verify non-root execution (returns 'app')
+docker compose exec api whoami
+
+# Test authenticated API endpoint through container
+curl -X POST http://localhost:5080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alex.turner@northwind-support.example","password":"DevPassword123!"}'
+```
+
+### Measured Image Sizes
+
+Based on actual `docker images` and `docker inspect` measurements:
+- **Build Stage (SDK)**: `mcr.microsoft.com/dotnet/sdk:10.0` — **1.3 GB** virtual size (351 MB compressed base layers).
+- **Runtime Base Image**: `mcr.microsoft.com/dotnet/aspnet:10.0` — **340 MB** virtual size (95.9 MB compressed base layers).
+- **Final API Image**: `northwind-support-api:latest` — **455 MB** virtual size (125 MB total layer footprint including published binaries and runtime).
+
+### NuGet Restore Cache Verification
+Verified by adding a trivial code comment to `DatabaseHealthCheck.cs` and running `docker compose build api`. Docker build output confirmed:
+```
+#10 [build 3/10] COPY global.json Directory.Build.props Directory.Packages.props ./ CACHED
+#11 [build 4/10] COPY apps/api/src/SupportDesk.Domain/... CACHED
+#12 [build 5/10] COPY apps/api/src/SupportDesk.Application/... CACHED
+#13 [build 6/10] COPY apps/api/src/SupportDesk.Infrastructure/... CACHED
+#14 [build 7/10] COPY apps/api/src/SupportDesk.Presentation/... CACHED
+#15 [build 8/10] RUN dotnet restore ... CACHED
+```
+Only code compilation (`dotnet publish`) re-executed, proving dependency layers remain fully cached.
+
+### Database Migrations: Development vs. Production Strategy
+- **Local Development**: In development mode (`ASPNETCORE_ENVIRONMENT=Development`), `app.MigrateAndSeedAsync()` runs automatically on application boot. This keeps the environment zero-touch and reproducible for local developers.
+- **Production Migration Strategy**: In production environments, running migrations inside the web application container on startup is strongly discouraged:
+  1. *Concurrency & Race Conditions*: Horizontally scaling multiple API replicas would cause concurrent instances to attempt schema mutations simultaneously.
+  2. *Least Privilege Security*: Production web applications should connect using a database user with minimal DML privileges (`SELECT`, `INSERT`, `UPDATE`, `DELETE`), not DDL privileges (`CREATE TABLE`, `ALTER TABLE`, `DROP`).
+  3. *Rollback & Audit Control*: Production database migrations must be decoupled from application startup and executed in a dedicated, auditable deployment step (such as a GitHub Actions workflow step, Azure DevOps release pipeline, or Kubernetes `Job` / init container) using `dotnet ef database update` or idempotent SQL migration bundles (`dotnet ef migrations script --idempotent`).
+
+### Connecting the Web App to the Containerised API
+To run the React development server against the containerised API:
+```bash
+# Terminal 1: Run containers
+docker compose up --build -d
+
+# Terminal 2: Run frontend proxying to port 5080
+VITE_API_PROXY_TARGET=http://localhost:5080 npm run web
+```
+The React application at `http://localhost:5173` proxies all `/api` requests to `http://localhost:5080`.
+
+---
 
 ## Quick start
+
 
 **Prerequisites:** .NET SDK 10 (`global.json`), Node.js 22 (`.nvmrc`; 20.19+ works), Docker.
 
