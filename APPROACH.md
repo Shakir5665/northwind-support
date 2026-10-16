@@ -212,3 +212,80 @@ Integrated the backend Task 2.2 business rules, API contracts, and triage/escala
 3. **ESLint (`eslint .`)**: 0 errors, 0 warnings.
 4. **Vite Production Bundle (`npm run build`)**: Succeeded cleanly (built in 710ms).
 
+---
+
+## Task 2.4: Comprehensive Automated Test Suite
+
+### 1. Requirements & Gap Analysis
+Based on the Task 2 inspection report, comprehensive unit, policy, and integration test coverage was implemented across the backend and frontend to verify all business rules (BR-1 through BR-8), database translation, and UI invariants without touching production code.
+
+### 2. Implementation & Test Architecture
+
+#### Backend Unit & Integration Tests (xUnit, Moq, EF Core)
+- **SLA Windows & Multipliers (`SlaCalculatorTests.cs`)**:
+  - Theory matrix across all 4 priorities (`Low`, `Medium`, `High`, `Critical`) for Standard (72h, 24h, 8h, 4h) and Premium (36h, 12h, 4h, 2h).
+  - Custom `MinimumWindowHours` floor enforcement (1h and 3h floor boundaries).
+  - Rejection of null `SlaOptions` via `ArgumentNullException`.
+- **Forced-Critical Category Behavior (`PriorityPolicyTests.cs`, `RaiseTicketCommandHandlerTests.cs`)**:
+  - Category flag `ForcesCriticalPriority` overrides requested priority (`Low`, `Medium`, `High`, `Critical`, or `null`).
+  - Command handler confirms SLA due date is derived from the Critical base window (4h standard / 2h premium) even if caller requested Low priority.
+- **Agent Workload & Assignment Policies (`AgentAssignmentPolicyTests.cs`)**:
+  - Fewest open ticket selection with deterministic tie-breaking by `Agent.Id` ascending.
+  - Specialist qualification requirement filtering (`RequiresSpecialist`).
+  - Capacity ceiling exclusion (`openTicketCount >= maxOpenTickets`) and inactive agent exclusion.
+  - Distinct explanatory failure reasons: empty pool, all inactive, all at capacity, or all specialists at capacity.
+  - Escalation re-evaluation (`ReevaluateAgentForEscalation`): owner retention when eligible, reassignment when inactive, reassignment when over-capacity or losing required specialization, and initial unassigned fallback.
+- **Ticket Escalation Lifecycle (`TicketEscalationTests.cs`, `EscalateTicketCommandHandlerTests.cs`)**:
+  - One-step priority escalation (`Low -> Medium -> High -> Critical`).
+  - Multiple sequential escalations maintaining chronological audit trails.
+  - Recalculation of SLA due date strictly from the injected current time (`FixedClock`), verified after clock advancement.
+  - Accurate escalation audit trail persistence (`FromPriority`, `ToPriority`, `FromAgentId`, `ToAgentId`, `FromDueAtUtc`, `ToDueAtUtc`, `Reason`, `EscalatedBy`, `EscalatedAtUtc`).
+  - Invariant rejections: Already Critical (409), Resolved/Closed (409), Missing ticket (404), reason length boundary validation (exact 5 and 500 chars valid; 4 and 501 chars rejected).
+- **SLA Exact Boundary Evaluation (`SlaEvaluatorTests.cs`)**:
+  - `NotApplicable`: Null due date (both unresolved and resolved).
+  - `Met`: Resolution on or before exact due date (`resolvedAtUtc <= dueAtUtc`).
+  - `Breached`: Resolution 1 tick / 1 second late; unresolved 1 tick / 1 second past due.
+  - `AtRisk`: Unresolved at exact due date; unresolved at exact 25.0% remaining window; unresolved with $< 25\%$ remaining.
+  - `WithinSla`: Unresolved with $> 25\%$ remaining (e.g. 250.001s / 1000s); zero or negative window duration before due date.
+- **SLA Filtering & SQL Translation (`TicketQueriesTests.cs`, `SqlServerSlaQueryTests.cs`)**:
+  - Verified on in-memory SQLite and live Microsoft SQL Server (`localhost:1433`).
+  - Covers `WithinSla`, `AtRisk`, `Breached`, `Met`, `NotApplicable`, and combined filters.
+  - Proves that the SQL Server `DateTime.Ticks` translation defect (HTTP 500) is permanently resolved via provider-aware `EF.Functions.DateDiffSecond` translation.
+
+#### Frontend Tests (Vitest, React Testing Library)
+- **Client-Side Escalation Reason Validation (`EscalationPanel.test.tsx`, `TicketDetailPage.test.tsx`)**:
+  - Reason $< 5$ characters (e.g. `"help"`) displays client-side validation message and blocks `ticketsApi.escalate`.
+  - Empty and whitespace-only reasons are rejected client-side without API calls.
+- **HTTP 409 Conflict Handling & Ticket Integrity (`EscalationPanel.test.tsx`, `TicketDetailPage.test.tsx`)**:
+  - When server returns HTTP 409, error banner is clearly displayed with `role="alert"`.
+  - Proves `onEscalated` callback is not called.
+  - Proves ticket priority badge in summary remains unchanged (remains `Medium` and does not become `High`).
+  - Proves escalation history on page does not add false records.
+- **SLA Indicator Accessibility & Distinct States (`SlaIndicator.test.tsx`)**:
+  - All 5 states (`WithinSla`, `AtRisk`, `Breached`, `Met`, `NotApplicable`) tested.
+  - Verified that every state provides unique visible text (`Within SLA`, `At risk`, `Breached`, `Met`, `No SLA`) and unique `aria-label` attribute (`SLA status: ...`).
+  - Verified each state uses distinct tone classes (`badge--info`, `badge--warning`, `badge--danger`, `badge--success`, `badge--neutral`), proving states do not rely on color alone.
+
+### 3. Verification Results Summary
+- **Backend Unit Tests (`SupportDesk.UnitTests`)**: 153 passed, 0 failed, 0 skipped.
+- **Architecture Tests (`SupportDesk.ArchitectureTests`)**: 4 passed, 0 failed.
+- **Frontend Tests (`apps/web`)**: 44 passed across 9 test files.
+- **TypeScript Typecheck (`tsc -b --noEmit`)**: 0 errors.
+- **ESLint (`eslint .`)**: 0 errors, 0 warnings.
+
+---
+
+## Task 2.5: Optional Stretch — SLA Summary Report
+
+### 1. Precondition & Dependency Gate
+Per `ASSIGNMENT_CANDIDATE.md` Section 2.5:
+> *"Only if Tasks 1-3 are finished and tested. GET /api/reports/sla-summary?from=&to=&groupBy=agent|priority returning, per group: total, breached, at risk, within, met, breach rate and average resolution hours. Must be a single database-side aggregation."*
+
+Because **Task 3 (Login and Authentication)** is required prior to stretch feature implementation, full code implementation is gated until Task 3 is finished and tested. Complete architecture and single-database aggregation designs are detailed in [SLA_SUMMARY_REPORT_DESIGN.md](file:///c:/Users/shaki/Desktop/northwind-support/SLA_SUMMARY_REPORT_DESIGN.md).
+
+### 2. Architectural Highlights
+- **Single Database-Side Aggregation**: All metrics (`total`, `breached`, `atRisk`, `within`, `met`, `breachRate`, `averageResolutionHours`) execute in a single SQL Server `GROUP BY` query with conditional aggregation (`COUNT(CASE WHEN ...)` and `AVG(...)`).
+- **Zero Client-Side Evaluation**: No in-memory filtering or grouping in C#; database engine computes aggregates before returning narrow DTO projections.
+- **SQL Server Translatability**: Employs `EF.Functions.DateDiffSecond` to ensure smooth T-SQL translation without client-side evaluation warnings.
+
+

@@ -217,6 +217,43 @@ Integrated Task 2.2 business rules and backend endpoints into the React 19 / Typ
 
 ---
 
+## Task 2.4 Comprehensive Tests
+
+### Implemented Coverage
+- **Backend (xUnit & Moq)**:
+  - `SlaCalculatorTests`: SLA windows for all priorities (`Low`, `Medium`, `High`, `Critical`), Premium tier halving (`0.5x`), configurable `MinimumWindowHours` floor, and null options rejection.
+  - `PriorityPolicyTests` & `RaiseTicketCommandHandlerTests`: Forced-Critical category priority override and alignment with Critical SLA window.
+  - `AgentAssignmentPolicyTests`: Fewest open tickets, deterministic `Agent.Id` ascending tie-breaking, specialist requirements, capacity limits, inactive agent exclusion, explanatory rejection reasons, and escalation re-evaluation.
+  - `TicketEscalationTests` & `EscalateTicketCommandHandlerTests`: One-step priority increase, SLA due date recalculation from injected clock (`FixedClock`), agent retention/reassignment/unassigned fallback, accurate escalation audit trail persistence, sequential multi-step escalations, 404/409/status rejections, and exact 5/500 char boundary validation.
+  - `SlaEvaluatorTests`: SLA evaluation at exact boundaries (`NotApplicable`, `Met`, `Breached`, `AtRisk`, `WithinSla`, 1-tick margins, and sub-second 25% threshold).
+  - `TicketQueriesTests` & `SqlServerSlaQueryTests`: Provider-aware SQL SLA filtering on SQLite and live SQL Server (`localhost:1433`) for all statuses (`WithinSla`, `AtRisk`, `Breached`, `Met`, `NotApplicable`) and combined filters.
+- **Frontend (Vitest & React Testing Library)**:
+  - `EscalationPanel.test.tsx` & `TicketDetailPage.test.tsx`: Client-side rejection of short reasons (< 5 chars) without calling API; clear display of HTTP 409 conflict errors without falsely updating ticket priority or escalation history.
+  - `SlaIndicator.test.tsx`: Distinct rendering of all 5 SLA states with unique visible labels, unique `aria-label` attributes, and distinct badge tones, ensuring status is not communicated by color alone.
+
+### Verification Results
+- `dotnet test apps/api/tests/SupportDesk.UnitTests`: 153 passed, 0 failed.
+- `dotnet test apps/api/tests/SupportDesk.ArchitectureTests --no-build`: 4 passed, 0 failed.
+- `npm test --workspace apps/web`: 44 passed across 9 suites, 0 failed.
+- `npm run typecheck --workspace apps/web`: 0 errors.
+- `npm run lint --workspace apps/web`: 0 errors.
+
+---
+
+## Task 2.5 Optional Stretch: SLA Summary Report
+
+### Gating Assessment
+Per `ASSIGNMENT_CANDIDATE.md` Section 2.5: *"Only if Tasks 1-3 are finished and tested."*
+Because **Task 3 (Login & Authentication)** is required before implementing stretch features, production code implementation is gated behind Task 3 completion.
+
+### Architecture & Single Database Aggregation Blueprint
+The complete endpoint specification, single SQL query architecture, and EF Core translation query are documented in [SLA_SUMMARY_REPORT_DESIGN.md](file:///c:/Users/shaki/Desktop/northwind-support/SLA_SUMMARY_REPORT_DESIGN.md):
+- **Endpoint**: `GET /api/reports/sla-summary?from=&to=&groupBy=agent|priority`
+- **Single SQL Query**: Evaluates `total`, `breached`, `atRisk`, `within`, `met`, `breachRate`, and `averageResolutionHours` in a single `GROUP BY` statement with conditional aggregation (`COUNT(CASE WHEN ...)` and `AVG(...)`).
+- **Zero Client-Side Evaluation**: Translates via `EF.Functions.DateDiffSecond` directly in SQL Server without client-side memory overhead.
+
+---
+
 ## Quick start
 
 **Prerequisites:** .NET SDK 10 (`global.json`), Node.js 22 (`.nvmrc`; 20.19+ works), Docker.
