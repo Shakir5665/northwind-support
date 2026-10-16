@@ -363,5 +363,87 @@ Because **Task 3 (Login and Authentication)** is required prior to stretch featu
   - **Account Lockout**: No tracking of failed login attempts or lockout periods.
   - **Rate Limiting / Brute-force Protection**: No throttling on `POST /api/auth/login`.
 
+---
+
+### Task 3.2: Frontend Authentication Architecture
+
+#### 1. Architecture & State Management: Lightweight React Context
+- **Design Decision**: Implemented authentication state using standard React Context (`AuthContext`, `AuthProvider`, `useAuth`) without adding external state management libraries (Redux, Zustand, etc.).
+- **Reasoning**:
+  - The application's state requirements are minimal: storing the current user profile, token presence, login mutation, and logout action.
+  - Adding an external store would violate the principle of simplicity and introduce unnecessary dependencies to the monorepo.
+  - Architectural separation: `AuthContext.ts` defines the context and contracts, `AuthProvider.tsx` encapsulates state and event listeners, and `useAuth.ts` exposes the hook. This modularity satisfies Vite's `react-refresh/only-export-components` linter rule cleanly.
+  - **State Initialization**: On application load or page reload, state synchronously initializes from `sessionStorage` (`getStoredToken()`, `getStoredUser()`) to avoid visual flicker or unwarranted redirects.
+  - **Backend Authority**: Stored tokens are not trusted unconditionally. The backend remains the source of truth; as soon as any protected API request encounters an expired or invalid token (HTTP 401), the frontend immediately clears the session and transitions to the login screen.
+
+#### 2. AU-9: Accessible Login Experience & Pre-Flight Validation
+- **Design Decision**: Built `/login` utilizing the existing `Field` and `card` design system, with accessible inputs (`type="email"`, `type="password"`), client-side pre-flight validation, and explicit pending states.
+- **Reasoning**:
+  - Pre-flight checks (required field verification and RFC-compliant email regex) prevent wasteful network round-trips for obvious input mistakes.
+  - In-flight submission sets `isSubmitting = true`, disabling both form fields and the submit button, displaying a `"Signing in..."` label to prevent accidental double-submissions.
+  - Error rendering distinguishes between 401 credential rejections (rendering the API's generic `"Invalid email or password."`) and transport/network failures (`"Unable to sign in. Please verify your connection and try again."`), giving actionable feedback to the user.
+  - If an already-authenticated user navigates to `/login`, `useEffect` immediately redirects them to their intended destination or `/tickets`.
+
+#### 3. AU-10: Token Storage Mechanism & Security Trade-offs
+- **Design Decision**: Persisted the JWT access token and agent profile in browser `sessionStorage` (`auth_token` and `auth_user`).
+- **Reasoning**:
+  - `sessionStorage` provides an isolated session per browser tab, automatically wiping credentials when the tab is closed. This prevents orphaned sessions on shared workstations.
+  - Unlike `localStorage`, which persists indefinitely across browser restarts, `sessionStorage` mirrors typical enterprise support desk session policies.
+  - Centralized storage access in `api/client.ts` (`getStoredToken`, `getStoredUser`, `setStoredSession`, `clearStoredSession`) ensures consistent token retrieval across all modules without code duplication.
+- **Security Trade-off (Web Storage vs. Cookies)**:
+  - *Advantage*: Immune to Cross-Site Request Forgery (CSRF) attacks because tokens are passed explicitly via the `Authorization: Bearer` header rather than automatically attached by the browser.
+  - *Trade-off*: Data in `sessionStorage` is accessible to client-side JavaScript within the same origin. An application with a Cross-Site Scripting (XSS) vulnerability would expose tokens to script access.
+  - *Production Recommendation*: In high-assurance production environments, backend-issued `HttpOnly`, `Secure`, `SameSite=Strict` cookies are recommended to eliminate client script access, accompanied by CSRF anti-forgery tokens. For this assessment, `sessionStorage` provides the optimal balance of simplicity, tab isolation, and zero-configuration developer setup.
+
+#### 4. AU-11: Route Protection & Open-Redirect Immunity
+- **Design Decision**: Implemented `ProtectedRoute` as a React Router layout route guarding all private routes, coupled with `getSafeReturnUrl` destination sanitization.
+- **Reasoning**:
+  - When an unauthenticated visitor attempts to access a protected URL (e.g. `/tickets/15?tab=escalations`), `ProtectedRoute` captures the full path and query string (`${location.pathname}${location.search}`) and passes it to `/login` via React Router's location state (`state: { from: destination }`).
+  - Upon successful authentication, `LoginPage` reads `location.state.from` (or `?from=...` query parameter) and routes the user back to the exact screen they requested.
+  - **Open-Redirect & Loop Prevention (`getSafeReturnUrl`)**:
+    - Enforces that destinations must begin with a single `/`.
+    - Explicitly rejects protocol-relative URLs (`//evil.com`) and external schemes (`https://`, `javascript:`) to eliminate phishing and open-redirect vectors.
+    - Specifically disallows `/login` as a return destination, preventing infinite redirect loops.
+    - Safely falls back to `/tickets` if no valid destination is provided.
+
+#### 5. AU-12: Agent Identity & Synchronous Logout
+- **Design Decision**: Integrated agent identity display (`user.name`) directly into `App.tsx`'s navigation bar, alongside a dedicated "Sign out" action.
+- **Reasoning**:
+  - Placing identity in the application shell provides immediate visual confirmation of the active operator.
+  - The "Sign out" action triggers `logout()` in `AuthContext`:
+    1. Synchronously wipes `sessionStorage` (`auth_token`, `auth_user`).
+    2. Resets React state (`user = null`, `token = null`).
+    3. Immediately navigates to `/login` (`replace: true`).
+  - Because `ProtectedRoute` continuously checks `isAuthenticated`, logging out instantly locks all protected routes, preventing the browser from remaining on or navigating to an unprotected ticket screen.
+
+#### 6. AU-13: Centralized HTTP 401 Handling & Debounce Guard
+- **Design Decision**: Intercepted HTTP 401 status codes centrally in `request()` inside `apps/web/src/api/client.ts`.
+- **Reasoning**:
+  - Eliminates the need to repeat 401 error-handling, logout, and redirection logic across individual query hooks or components.
+  - **Exempting Normal Login Failures**: An HTTP 401 from `POST /api/auth/login` indicates bad credentials, not an expired session. The client explicitly checks `path !== '/auth/login'` before invoking global session clearing, preventing redirect loops and allowing `LoginPage` to display the error.
+  - **Concurrent Request Debouncing**: When multiple API queries execute simultaneously (e.g. `getTickets`, `getAgents`, `getCategories` upon page load) and the token has expired, all queries return 401 concurrently. An in-flight flag (`isHandlingUnauthorized`) debounces the handler, ensuring only a single session clear and redirect to `/login` occurs, preventing navigation race conditions.
+  - **Path Preservation**: Captures the active path (`window.location.pathname + window.location.search`) when the 401 occurs, allowing the user to seamlessly resume their workflow after re-authenticating.
+
+#### 7. Verification & Quality Assurance Summary
+- **Vitest Unit & Integration Tests (`apps/web`)**: 68 tests passing across 12 suites:
+  - Form validation, required fields, and email regex syntax.
+  - Rejected 401 credentials and error banner visibility without session creation.
+  - Pending state, control disabling, and double-click prevention.
+  - Successful authentication, token persistence, and return navigation.
+  - Already-authenticated redirect away from `/login`.
+  - Protected route redirection with state preservation.
+  - Application header agent identity and immediate logout session clearing.
+  - Centralized Bearer token attachment on authenticated requests.
+  - Omission of Bearer token on `/auth/login`.
+  - Global 401 session clearing and navigation.
+  - Exemption of `/auth/login` from 401 logout redirect.
+  - Concurrent 401 debounce protection.
+  - Open-redirect and redirect-loop rejection in `getSafeReturnUrl`.
+- **Static Analysis & Production Bundle**:
+  - `npm run typecheck --workspace apps/web`: 0 errors (`tsc -b --noEmit`).
+  - `npm run lint --workspace apps/web`: 0 errors, 0 warnings (`eslint .`).
+  - `npm run build --workspace apps/web`: Production bundle compiled cleanly in 474ms.
+
+
 
 

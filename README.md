@@ -387,6 +387,53 @@ Anonymous requests to any protected endpoint return `401 Unauthorized`. Login an
 
 ---
 
+## Task 3.2 Frontend Authentication
+
+### Overview & Features Implemented
+Integrated backend Task 3.1 authentication into the React 19 / TypeScript application with centralized state, route protection, token attachment, and global 401 handling:
+
+| Feature | Component / File | Behavior & Contract |
+|---|---|---|
+| **Login Page** | `features/auth/LoginPage.tsx` | Dedicated `/login` route with email and password fields. Validates required fields and email syntax on the client before calling the API. Displays pending state, prevents double submission, presents clear error messages on 401 credential rejections or network failures, and redirects authenticated users. |
+| **Token Storage** | `api/client.ts` | Stores the JWT token and authenticated agent profile in `sessionStorage` (`auth_token`, `auth_user`). Centralized accessor and mutator helpers ensure consistent persistence across the application. Password is never stored. |
+| **Bearer Attachment** | `api/client.ts` | Automatically attaches `Authorization: Bearer <token>` to all authenticated API calls. Omitted for `/auth/login`. Restricted to internal API endpoints (`${baseUrl}${path}`) and never attached to external URLs. |
+| **Route Protection** | `features/auth/ProtectedRoute.tsx` | Guards private routes (`/tickets`, `/tickets/new`, `/tickets/:id`, `/customers`, `/customers/:id`). Redirects unauthenticated visitors to `/login`, capturing the full requested URL and query parameters. |
+| **Return Navigation** | `api/client.ts` · `LoginPage.tsx` | `getSafeReturnUrl` safely validates return destinations, rejecting external URLs, protocol-relative attacks (`//evil.com`), and `/login` loops. Upon login, smoothly returns the user to their requested destination or `/tickets`. |
+| **Agent Identity & Logout** | `App.tsx` · `features/auth/AuthProvider.tsx` | Displays the signed-in agent's name (`user.name`) in the top navigation header. "Sign out" button immediately wipes the session, resets React auth state, and navigates to `/login`. |
+| **Global 401 Handling** | `api/client.ts` · `features/auth/AuthProvider.tsx` | Intercepts HTTP 401 responses on authenticated requests, clears stored credentials, debounces concurrent redirect storms, and navigates to `/login` with the current path preserved. Normal login failures on `/auth/login` are exempted from redirection to display error banners. |
+| **Lightweight State** | `features/auth/AuthContext.ts` · `useAuth.ts` | Context-based authentication state initialized from `sessionStorage` on page reload. The backend remains the authority on token validity. |
+
+### Token Storage & Security Trade-offs
+The frontend stores the JWT access token and user profile in browser `sessionStorage`:
+
+- **Lifespan**: Scoped strictly to the browser tab or window. Closing the tab ends the session.
+- **CSRF Immunity**: Storing the token in memory/sessionStorage and sending it via the `Authorization: Bearer` header eliminates Cross-Site Request Forgery (CSRF) vulnerabilities common with cookie-based authentication.
+- **XSS Exposure Trade-off**:
+  > [!WARNING]
+  > **Security Trade-off**: Any data stored in `sessionStorage` or `localStorage` is accessible to JavaScript executing in the same origin. If a Cross-Site Scripting (XSS) vulnerability exists, the stored token can be accessed by malicious scripts.
+  > In high-security production deployments, using `HttpOnly`, `Secure`, and `SameSite=Strict` cookies issued by the backend prevents client-side script access to the token. For this assessment, `sessionStorage` was chosen as the simplest appropriate mechanism, providing tab isolation and stateless Bearer authorization without complex cookie synchronization or refresh token state machines.
+
+### Calling Authenticated Endpoints from the Web App
+All requests made through `request()` in `apps/web/src/api/client.ts` automatically retrieve the stored token from `sessionStorage` and attach it:
+```typescript
+if (token && path !== '/auth/login' && !headers['Authorization']) {
+  headers['Authorization'] = `Bearer ${token}`;
+}
+```
+
+### Verification & Tests Run
+- **Frontend Tests (`npm test --workspace apps/web`)**: 68 passed across 12 test suites (Vitest):
+  - `LoginPage.test.tsx` (9 tests): Form rendering, required field validation, email format checking, pending state and double-click prevention, rejected 401 credentials error display, network failure handling, session persistence, return navigation, and already-authenticated redirect.
+  - `AuthFlow.test.tsx` (4 tests): Protected route redirect to `/login` with return state, authenticated access, agent identity header display, logout session clearing, and global 401 redirect from authenticated requests.
+  - `client.test.ts` (11 tests): Storage helper methods, Bearer token attachment, skipping token on `/auth/login`, 401 session clearing and unauthorized handler invocation, exempting `/auth/login` from 401 logout, concurrent 401 debounce guard, and `getSafeReturnUrl` open-redirect security.
+  - Existing ticket, escalation, and SLA test suites (44 tests) all pass without regressions.
+- **TypeScript Typecheck (`npm run typecheck --workspace apps/web`)**: 0 errors.
+- **ESLint (`npm run lint --workspace apps/web`)**: 0 errors, 0 warnings.
+- **Vite Production Build (`npm run build --workspace apps/web`)**: Succeeded cleanly (built in 474ms).
+
+---
+
+
 ## Quick start
 
 **Prerequisites:** .NET SDK 10 (`global.json`), Node.js 22 (`.nvmrc`; 20.19+ works), Docker.
