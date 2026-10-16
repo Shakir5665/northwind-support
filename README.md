@@ -507,13 +507,26 @@ Only code compilation (`dotnet publish`) re-executed, proving dependency layers 
 
 ### Connecting the Web App to the Containerised API
 To run the React development server against the containerised API:
-```bash
-# Terminal 1: Run containers
-docker compose up --build -d
 
-# Terminal 2: Run frontend proxying to port 5080
-VITE_API_PROXY_TARGET=http://localhost:5080 npm run web
+**Terminal 1 (Start containers):**
+```bash
+docker compose up --build -d
 ```
+
+**Terminal 2 (Start frontend proxying to port 5080):**
+- **PowerShell (Windows):**
+  ```powershell
+  $env:VITE_API_PROXY_TARGET="http://localhost:5080"; npm run web
+  ```
+- **Bash / macOS / Linux:**
+  ```bash
+  VITE_API_PROXY_TARGET=http://localhost:5080 npm run web
+  ```
+- **Windows Command Prompt (cmd.exe):**
+  ```cmd
+  set "VITE_API_PROXY_TARGET=http://localhost:5080" && npm run web
+  ```
+
 The React application at `http://localhost:5173` proxies all `/api` requests to `http://localhost:5080`.
 
 ---
