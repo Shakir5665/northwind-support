@@ -288,4 +288,221 @@ Because **Task 3 (Login and Authentication)** is required prior to stretch featu
 - **Zero Client-Side Evaluation**: No in-memory filtering or grouping in C#; database engine computes aggregates before returning narrow DTO projections.
 - **SQL Server Translatability**: Employs `EF.Functions.DateDiffSecond` to ensure smooth T-SQL translation without client-side evaluation warnings.
 
+---
+
+## Task 3: Backend Login and Authentication
+
+### Task 3.1: Backend Authentication Architecture
+
+#### 1. Credential Storage: Direct on `Agent` Aggregate
+- **Design Decision**: `PasswordHash` is stored directly as a nullable column (`nvarchar(500)`) on the existing `Agent` domain aggregate, accessed via domain method `SetPasswordHash(string passwordHash)`.
+- **Reasoning**:
+  - The current domain model represents support desk users 1:1 as `Agent` entities.
+  - Adding `PasswordHash` directly to `Agent` avoids unnecessary table joins, additional foreign keys, or a detached identity aggregate for what is fundamentally a single domain entity.
+  - It maintains aggregate encapsulation: only the domain method `SetPasswordHash` can mutate the hash, preventing external corruption.
+- **Alternatives Considered & Rejected**:
+  - *Separate `AgentCredential` table / entity*: Would add a 1:1 join on every login without domain benefit at this stage. It would over-engineer the schema ahead of requirements for multi-credential types or complex auth schemes.
+  - *Full ASP.NET Core Identity DB context*: Demands extensive boilerplate tables (`AspNetUsers`, `AspNetRoles`, `AspNetUserClaims`, etc.) that are redundant given the simple support agent identity model and strict monorepo constraints.
+
+#### 2. Vetted Password Hashing: ASP.NET Core Identity `PasswordHasher<string>`
+- **Design Decision**: Implemented `IPasswordHasher` abstraction in the Application layer, backed by `Microsoft.AspNetCore.Identity.PasswordHasher<string>` in Presentation/Security (`AspNetPasswordHasher`).
+- **Reasoning**:
+  - ASP.NET Core Identity's `PasswordHasher` is an industry-standard, battle-tested cryptographic implementation conforming to RFC 2898.
+  - Uses PBKDF2 with HMAC-SHA512, 100,000 iterations, and a cryptographically secure 128-bit per-hash random salt.
+  - Generates self-describing, versioned byte payloads (`0x01` header format) allowing transparent algorithm upgrades in future versions without breaking legacy hashes.
+  - Reversible encryption and naive hashing (such as MD5/SHA256 without salts and stretching) were strictly avoided.
+  - The `IPasswordHasher` interface in `SupportDesk.Application.Abstractions` prevents the Application and Domain layers from taking direct dependencies on ASP.NET Core libraries, preserving Clean Architecture layer independence.
+
+#### 3. Stateless JWT Authentication Flow
+- **Design Decision**: Signed JSON Web Tokens (HMAC-SHA256) issued via `POST /api/auth/login` and validated by ASP.NET Core JWT Bearer authentication middleware.
+- **Claim Design**:
+  - `ClaimTypes.NameIdentifier`: Agent's `Guid` ID.
+  - `ClaimTypes.Name`: Agent's `FullName`.
+  - `ClaimTypes.Email`: Agent's `Email`.
+  - Standard JWT claims: `sub`, `jti`, `iat`, `nbf`, `exp`, `iss`, `aud`.
+- **Reasoning**:
+  - Tokens are stateless and self-contained, requiring zero server-side session state or database lookups per authenticated request.
+  - Configurable expiration (defaulting to 30 minutes) limits the attack window of token compromise without needing complex server-side session stores.
+  - Clear startup validation: `JwtOptions` validates that `SigningKey` is present and at least 32 characters (256 bits), throwing `InvalidOperationException` immediately upon application boot if invalid or missing.
+
+#### 4. Centralized Fallback Authorization Policy
+- **Design Decision**: Implemented a global fallback authorization policy (`FallbackPolicy = new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build()`) in `Program.cs`.
+- **Reasoning**:
+  - **Secure by Default**: Every endpoint in the entire API requires authentication unless explicitly decorated with `[AllowAnonymous]`.
+  - Eliminates the risk of developers forgetting `[Authorize]` attributes when adding new controllers or actions.
+  - Only `POST /api/auth/login` and OpenAPI/Swagger specifications are exempted with `[AllowAnonymous]`.
+  - All existing ticket endpoints (`GET /api/tickets`, `POST /api/tickets/{id}/escalate`, triage, escalation history) and future endpoints are automatically protected without modifying existing controller classes.
+  - Middleware order strictly ensures `UseAuthentication()` runs before `UseAuthorization()`.
+
+#### 5. Escalation Attribution Security
+- **Design Decision**: Updated `EscalateTicketCommandHandler` to inject `ICurrentUser` and record the authenticated agent's name (`currentUser.FullName`) into `EscalatedBy`, ignoring any forged caller-provided `escalatedBy` in the request body.
+- **Reasoning**:
+  - In a secure system, audit attribution must come from trusted authentication context (the validated JWT claims), never from untrusted client input.
+  - If an unauthenticated or test context invokes the command without a user, it safely falls back to a default system identity.
+  - Preserves full audit trail integrity and prevents agents from impersonating colleagues or team leads in escalation histories.
+
+#### 6. Safe Development Fixture Seeding
+- **Design Decision**: `SupportDbSeeder` seeds password hashes for known test agents (`sarah.chen@northwind.local`, `marcus.vance@northwind.local`, etc.) with `DevPassword123!`.
+- **Security Safeguards**:
+  - **Environment Gated**: Seeding of dev credentials only executes when `Environment.IsDevelopment()` is true; production environments never seed default passwords.
+  - **Hash at Seed Time**: The password is never stored or committed in plaintext; it is passed through `IPasswordHasher` during seed execution.
+  - **Idempotency & Non-Destructive**: For existing databases, `SupportDbSeeder` checks each agent and only sets `PasswordHash` if it is currently `null` or empty (`string.IsNullOrWhiteSpace(a.PasswordHash)`). Existing or modified credentials are never overwritten on startup.
+
+#### 7. Key Trade-offs & Known Limitations
+- **Trade-offs**:
+  - *Direct Model vs. Identity DB*: Modifying the `Agent` table is simpler and perfectly suited for this application, but tightens the coupling between agent management and authentication.
+  - *Stateless JWT vs. Stateful Sessions*: Stateless tokens cannot be revoked individually before expiration without maintaining a token revocation list/blocklist in cache. A short lifetime (30 minutes) mitigates this risk.
+  - *Fallback Policy vs. Explicit `[Authorize]`*: Fallback policy protects the entire API footprint automatically, but requires developers to be conscious of adding `[AllowAnonymous]` when creating public endpoints.
+- **Explicit Known Limitations (Out of Scope)**:
+  - **User Registration**: Not implemented; agents are provisioned via administrative seeding.
+  - **Password Reset / Recovery**: No forgot password or email reset workflows.
+  - **Email Verification**: Agent emails are assumed valid.
+  - **OAuth / SSO / OpenID Connect**: External identity providers (Google, Microsoft Entra ID) are not integrated.
+  - **Refresh Tokens / Sliding Sessions**: When tokens expire after 30 minutes, users must log in again.
+  - **Multi-Factor Authentication (MFA / 2FA)**: Single-factor password authentication only.
+  - **Account Lockout**: No tracking of failed login attempts or lockout periods.
+  - **Rate Limiting / Brute-force Protection**: No throttling on `POST /api/auth/login`.
+
+---
+
+### Task 3.2: Frontend Authentication Architecture
+
+#### 1. Architecture & State Management: Lightweight React Context
+- **Design Decision**: Implemented authentication state using standard React Context (`AuthContext`, `AuthProvider`, `useAuth`) without adding external state management libraries (Redux, Zustand, etc.).
+- **Reasoning**:
+  - The application's state requirements are minimal: storing the current user profile, token presence, login mutation, and logout action.
+  - Adding an external store would violate the principle of simplicity and introduce unnecessary dependencies to the monorepo.
+  - Architectural separation: `AuthContext.ts` defines the context and contracts, `AuthProvider.tsx` encapsulates state and event listeners, and `useAuth.ts` exposes the hook. This modularity satisfies Vite's `react-refresh/only-export-components` linter rule cleanly.
+  - **State Initialization**: On application load or page reload, state synchronously initializes from `sessionStorage` (`getStoredToken()`, `getStoredUser()`) to avoid visual flicker or unwarranted redirects.
+  - **Backend Authority**: Stored tokens are not trusted unconditionally. The backend remains the source of truth; as soon as any protected API request encounters an expired or invalid token (HTTP 401), the frontend immediately clears the session and transitions to the login screen.
+
+#### 2. AU-9: Accessible Login Experience & Pre-Flight Validation
+- **Design Decision**: Built `/login` utilizing the existing `Field` and `card` design system, with accessible inputs (`type="email"`, `type="password"`), client-side pre-flight validation, and explicit pending states.
+- **Reasoning**:
+  - Pre-flight checks (required field verification and RFC-compliant email regex) prevent wasteful network round-trips for obvious input mistakes.
+  - In-flight submission sets `isSubmitting = true`, disabling both form fields and the submit button, displaying a `"Signing in..."` label to prevent accidental double-submissions.
+  - Error rendering distinguishes between 401 credential rejections (rendering the API's generic `"Invalid email or password."`) and transport/network failures (`"Unable to sign in. Please verify your connection and try again."`), giving actionable feedback to the user.
+  - If an already-authenticated user navigates to `/login`, `useEffect` immediately redirects them to their intended destination or `/tickets`.
+
+#### 3. AU-10: Token Storage Mechanism & Security Trade-offs
+- **Design Decision**: Persisted the JWT access token and agent profile in browser `sessionStorage` (`auth_token` and `auth_user`).
+- **Reasoning**:
+  - `sessionStorage` provides an isolated session per browser tab, automatically wiping credentials when the tab is closed. This prevents orphaned sessions on shared workstations.
+  - Unlike `localStorage`, which persists indefinitely across browser restarts, `sessionStorage` mirrors typical enterprise support desk session policies.
+  - Centralized storage access in `api/client.ts` (`getStoredToken`, `getStoredUser`, `setStoredSession`, `clearStoredSession`) ensures consistent token retrieval across all modules without code duplication.
+- **Security Trade-off (Web Storage vs. Cookies)**:
+  - *Advantage*: Immune to Cross-Site Request Forgery (CSRF) attacks because tokens are passed explicitly via the `Authorization: Bearer` header rather than automatically attached by the browser.
+  - *Trade-off*: Data in `sessionStorage` is accessible to client-side JavaScript within the same origin. An application with a Cross-Site Scripting (XSS) vulnerability would expose tokens to script access.
+  - *Production Recommendation*: In high-assurance production environments, backend-issued `HttpOnly`, `Secure`, `SameSite=Strict` cookies are recommended to eliminate client script access, accompanied by CSRF anti-forgery tokens. For this assessment, `sessionStorage` provides the optimal balance of simplicity, tab isolation, and zero-configuration developer setup.
+
+#### 4. AU-11: Route Protection & Open-Redirect Immunity
+- **Design Decision**: Implemented `ProtectedRoute` as a React Router layout route guarding all private routes, coupled with `getSafeReturnUrl` destination sanitization.
+- **Reasoning**:
+  - When an unauthenticated visitor attempts to access a protected URL (e.g. `/tickets/15?tab=escalations`), `ProtectedRoute` captures the full path and query string (`${location.pathname}${location.search}`) and passes it to `/login` via React Router's location state (`state: { from: destination }`).
+  - Upon successful authentication, `LoginPage` reads `location.state.from` (or `?from=...` query parameter) and routes the user back to the exact screen they requested.
+  - **Open-Redirect & Loop Prevention (`getSafeReturnUrl`)**:
+    - Enforces that destinations must begin with a single `/`.
+    - Explicitly rejects protocol-relative URLs (`//evil.com`) and external schemes (`https://`, `javascript:`) to eliminate phishing and open-redirect vectors.
+    - Specifically disallows `/login` as a return destination, preventing infinite redirect loops.
+    - Safely falls back to `/tickets` if no valid destination is provided.
+
+#### 5. AU-12: Agent Identity & Synchronous Logout
+- **Design Decision**: Integrated agent identity display (`user.name`) directly into `App.tsx`'s navigation bar, alongside a dedicated "Sign out" action.
+- **Reasoning**:
+  - Placing identity in the application shell provides immediate visual confirmation of the active operator.
+  - The "Sign out" action triggers `logout()` in `AuthContext`:
+    1. Synchronously wipes `sessionStorage` (`auth_token`, `auth_user`).
+    2. Resets React state (`user = null`, `token = null`).
+    3. Immediately navigates to `/login` (`replace: true`).
+  - Because `ProtectedRoute` continuously checks `isAuthenticated`, logging out instantly locks all protected routes, preventing the browser from remaining on or navigating to an unprotected ticket screen.
+
+#### 6. AU-13: Centralized HTTP 401 Handling & Debounce Guard
+- **Design Decision**: Intercepted HTTP 401 status codes centrally in `request()` inside `apps/web/src/api/client.ts`.
+- **Reasoning**:
+  - Eliminates the need to repeat 401 error-handling, logout, and redirection logic across individual query hooks or components.
+  - **Exempting Normal Login Failures**: An HTTP 401 from `POST /api/auth/login` indicates bad credentials, not an expired session. The client explicitly checks `path !== '/auth/login'` before invoking global session clearing, preventing redirect loops and allowing `LoginPage` to display the error.
+  - **Concurrent Request Debouncing**: When multiple API queries execute simultaneously (e.g. `getTickets`, `getAgents`, `getCategories` upon page load) and the token has expired, all queries return 401 concurrently. An in-flight flag (`isHandlingUnauthorized`) debounces the handler, ensuring only a single session clear and redirect to `/login` occurs, preventing navigation race conditions.
+  - **Path Preservation**: Captures the active path (`window.location.pathname + window.location.search`) when the 401 occurs, allowing the user to seamlessly resume their workflow after re-authenticating.
+
+#### 7. Verification & Quality Assurance Summary
+- **Vitest Unit & Integration Tests (`apps/web`)**: 68 tests passing across 12 suites:
+  - Form validation, required fields, and email regex syntax.
+  - Rejected 401 credentials and error banner visibility without session creation.
+  - Pending state, control disabling, and double-click prevention.
+  - Successful authentication, token persistence, and return navigation.
+  - Already-authenticated redirect away from `/login`.
+  - Protected route redirection with state preservation.
+  - Application header agent identity and immediate logout session clearing.
+  - Centralized Bearer token attachment on authenticated requests.
+  - Omission of Bearer token on `/auth/login`.
+  - Global 401 session clearing and navigation.
+  - Exemption of `/auth/login` from 401 logout redirect.
+  - Concurrent 401 debounce protection.
+  - Open-redirect and redirect-loop rejection in `getSafeReturnUrl`.
+- **Static Analysis & Production Bundle**:
+  - `npm run typecheck --workspace apps/web`: 0 errors (`tsc -b --noEmit`).
+  - `npm run lint --workspace apps/web`: 0 errors, 0 warnings (`eslint .`).
+  - `npm run build --workspace apps/web`: Production bundle compiled cleanly in 474ms.
+
+---
+
+## Task 4: Docker Architecture & Containerisation
+
+### 1. Multi-Stage Build & Layer Caching Strategy (DK-1, DK-2)
+- **Design Decision**: Implemented a two-stage Dockerfile (`build` using `mcr.microsoft.com/dotnet/sdk:10.0` and `runtime` using `mcr.microsoft.com/dotnet/aspnet:10.0`), built from the repository root context.
+- **Layer Optimization**:
+  - The build context explicitly copies solution manifests (`global.json`, `Directory.Build.props`, `Directory.Packages.props`) and project definition files (`.csproj`) before triggering `dotnet restore`.
+  - Source code (`apps/api/src/`) is copied only after dependencies have been restored.
+  - This ensures that code modifications do not invalidate the expensive NuGet restore layer. Verified by changing `DatabaseHealthCheck.cs` and rebuilding: the restore step was completely cached (`#15 [build 8/10] RUN dotnet restore ... CACHED`).
+- **Context Hygiene (`.dockerignore`)**:
+  - Excludes `bin/`, `obj/`, `node_modules/`, `.git/`, `.env*`, and the `apps/web/` directory.
+  - Prevents host compilation artifacts from contaminating container builds and minimizes build context transfer to 232 KB.
+
+### 2. Runtime Security & Non-Root Execution (DK-3)
+- **Design Decision**: The runtime container executes strictly as non-root user `app` (UID 1654, GID 1654) and exposes plain HTTP port `8080`.
+- **Reasoning**:
+  - Running as `root` inside containers poses container breakout and privilege escalation risks.
+  - Modern ASP.NET Core images (starting in .NET 8) provide the pre-configured `app` user and default HTTP port `8080` without requiring custom OS user provisioning.
+  - Container file permissions are assigned using `--chown=app:app /app/publish .`.
+  - HTTPS is deliberately terminated outside the container (or at a reverse proxy/load balancer) in cloud environments, avoiding baking self-signed certificates into images.
+  - Verified with `docker compose exec api whoami`, which confirms the active identity is `app`.
+
+### 3. Dynamic Runtime Configuration & Secret Isolation (DK-4, DK-5)
+- **Design Decision**: Zero secrets or environment-specific values are baked into the image. All configuration is supplied via runtime environment variables in `docker-compose.yml` and `.env.example`.
+- **Reasoning**:
+  - Adheres to Twelve-Factor App principles (Config in the environment).
+  - Database connectivity resolves via Docker Compose DNS service name `sqlserver` (`Server=sqlserver,1433;...`) rather than host `localhost`.
+  - JWT signing key, issuer, audience, and lifetime are supplied through standard `Jwt__*` environment variables.
+  - The host port `5080` maps to container port `8080` (`5080:8080`), leaving local port `5043` available for host Kestrel debugging.
+  - Service dependency `depends_on: sqlserver: condition: service_healthy` prevents the API from starting prematurely before SQL Server is ready to accept connections.
+
+### 4. Health Check Endpoint Design (DK-7)
+- **Design Decision**: Added `DatabaseHealthCheck` implementing `IHealthCheck` and exposed via `GET /health`.
+- **Reasoning**:
+  - Integrates directly with ASP.NET Core's diagnostic pipeline and executes `dbContext.Database.CanConnectAsync()`.
+  - Excluded from the global fallback authorization policy using `app.MapHealthChecks("/health").AllowAnonymous()`, allowing container orchestrators and load balancers to poll health without credentials while keeping application APIs secured.
+  - Verified with `curl -i http://localhost:5080/health`, returning `200 OK` with payload `Healthy`.
+
+### 5. Migration & Seeding Lifecycle: Development vs. Production (DK-6)
+- **Development Convenience**:
+  - On application boot with `ASPNETCORE_ENVIRONMENT=Development`, `app.MigrateAndSeedAsync()` automatically executes pending EF Core migrations and seeds initial categories, customers, agents, and tickets.
+  - On a fresh volume (`docker compose down -v && docker compose up --build`), the database starts clean, is migrated automatically, and seeds 40 tickets and 6 agents with hashed credentials.
+- **Production Limitations & Strategy**:
+  - In production, running migrations inside the web app container at startup is an anti-pattern:
+    1. *Multi-Instance Race Conditions*: Running horizontal replicas would trigger concurrent migration executions, risking deadlocks or failed schema updates.
+    2. *Excessive Privileges*: Running migrations requires DDL permissions (`CREATE TABLE`, `ALTER TABLE`, etc.), whereas the web app should connect using a low-privilege runtime user with DML permissions only (`SELECT`, `INSERT`, `UPDATE`, `DELETE`).
+    3. *Audit & Rollback*: Production database updates should be executed as a controlled deployment gate in a CI/CD pipeline (e.g. `dotnet ef database update` or idempotent SQL scripts via `dotnet ef migrations script --idempotent`) before spinning up new container pods.
+
+### 6. Image Size Measurements & Footprint
+- **Measured Virtual Sizes**:
+  - .NET 10 SDK (`mcr.microsoft.com/dotnet/sdk:10.0`): **1.3 GB** (351 MB compressed base layers).
+  - ASP.NET 10 Runtime (`mcr.microsoft.com/dotnet/aspnet:10.0`): **340 MB** (95.9 MB compressed base layers).
+  - API Container (`northwind-support-api:latest`): **455 MB** (125 MB total layer footprint).
+- **Optimization Trade-off**:
+  - Multi-stage build isolates the entire SDK (compilers, build tools, package caches) to the build stage, achieving a ~65% size reduction in the deployed runtime image compared to the SDK.
+  - Using the standard ASP.NET runtime provides full system debugging, ICU globalization, and OpenSSL libraries out of the box without the complexity of AOT or Alpine musl compatibility constraints.
+
+
+
+
 

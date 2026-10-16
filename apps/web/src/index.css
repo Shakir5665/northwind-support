@@ -509,3 +509,42 @@ textarea[aria-invalid='true'] {
 .history-item__details dd {
   margin: 0;
 }
+
+/* Authentication & Navigation Header */
+.app__user {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 0.9rem;
+}
+
+.app__user-name {
+  font-weight: 500;
+  color: var(--colour-text);
+}
+
+.login-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 40px 16px;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 420px;
+  padding: 32px;
+}
+
+.login-card__header {
+  margin-bottom: 24px;
+  text-align: center;
+}
+
+.login-card__subtitle {
+  color: var(--colour-muted);
+  margin: 6px 0 0;
+  font-size: 0.9rem;
+}
+

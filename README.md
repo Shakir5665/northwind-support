@@ -254,7 +254,272 @@ The complete endpoint specification, single SQL query architecture, and EF Core 
 
 ---
 
+## Task 3: Backend Login and Authentication (Task 3.1)
+
+### Authentication Overview
+The Northwind Support Desk backend is secured using signed JSON Web Tokens (JWT) and ASP.NET Core Bearer authentication with a centralized fallback authorization policy:
+- **Credentials Storage**: A nullable `PasswordHash` column (`nvarchar(500) NULL`) was added directly to the `Agents` table mapped through the `Agent` domain aggregate.
+- **Password Hashing**: Implements `IPasswordHasher` using ASP.NET Core Identity's vetted `PasswordHasher<string>` (PBKDF2 with HMAC-SHA512, cryptographically secure 128-bit per-hash salt, and versioned hashing). Plaintext passwords and reversible encryption are never stored.
+- **Centralized Endpoint Protection**: A fallback authorization policy (`options.FallbackPolicy = new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build()`) protects all application endpoints by default (`/api/tickets`, `/api/agents`, `/api/customers`, `/api/categories`, `/api/auth/me`). Only `POST /api/auth/login` (`[AllowAnonymous]`) and Swagger endpoints remain anonymous.
+- **Escalation Attribution**: `POST /api/tickets/{id}/escalate` extracts the escalating agent's identity directly from the validated JWT claims (`NameIdentifier`, `Name`, `Email`), ignoring any forged `escalatedBy` values provided in the request body.
+
+### Local Development Credentials & Security Note
+> [!CAUTION]
+> **Security Notice**: Development credentials are local fixtures only. They are seeded exclusively in local development environments and must **never** be used in production.
+
+- **Development Password**: `DevPassword123!`
+- **Seeded Active Agent (Default)**: `alex.turner@northwind-support.example`
+- **Other Seeded Active Agents**:
+  - `ben.osei@northwind-support.example`
+  - `priya.nair@northwind-support.example`
+  - `sara.lindqvist@northwind-support.example`
+  - `marcus.doyle@northwind-support.example`
+- **Seeded Inactive Agent**:
+  - `yuki.tanaka@northwind-support.example` (Deactivated; rejected with 401 on login)
+- **Seeder Idempotency & Safe Backfilling**: Credentials are generated and hashed at seed time using the same `IPasswordHasher`. Existing agent credentials are never overwritten on application startup. For existing databases with pre-existing tickets, unhashed agents are safely backfilled without resetting active credentials. Development seeding is gated under `app.Environment.IsDevelopment()`.
+
+### JWT Configuration & Environment Variables
+The JWT signing key is read from configuration or environment variables. No secret keys are hardcoded in source code or committed to git.
+
+- **Token Lifetime**: `30` minutes (reasonable balance between security and developer workflow).
+- **Validation**: Strict validation of cryptographic signature (`HmacSha256`), issuer, audience, and expiration lifetime with zero clock skew.
+- **Startup Guard**: The application strictly validates at startup that `Jwt:SigningKey` is present and at least 32 characters long (256 bits). If missing or invalid, startup fails immediately with a clear error:
+  ```
+  InvalidOperationException: JWT signing key is missing or invalid. Set 'Jwt:SigningKey' in configuration or 'Jwt__SigningKey' environment variable with at least 32 characters.
+  ```
+
+#### Required Environment Variables (`.env.example`)
+```env
+# --- JWT Authentication -----------------------------------------------------
+# Symmetric key used to sign and validate JWT tokens. Must be at least 32 characters (256 bits).
+# For production, generate a cryptographically strong random secret.
+Jwt__SigningKey=local-development-secret-key-at-least-32-chars-long!
+Jwt__Issuer=SupportDesk
+Jwt__Audience=SupportDeskClient
+Jwt__LifetimeMinutes=30
+```
+
+### Database Migration Instructions
+The database change adds `PasswordHash` to the `Agents` table via an EF Core migration:
+```bash
+# Generate the migration (already committed as AddAgentPasswordHash)
+npm run ef -- migrations add AddAgentPasswordHash -o Data/Migrations
+
+# Apply migrations to the local database
+npm run db:migrate
+```
+
+### API Contracts
+
+#### 1. Agent Login (`POST /api/auth/login`)
+Public endpoint (`[AllowAnonymous]`). Accepts email and password.
+
+**Request:**
+```http
+POST /api/auth/login HTTP/1.1
+Host: localhost:5043
+Content-Type: application/json
+
+{
+  "email": "alex.turner@northwind-support.example",
+  "password": "DevPassword123!"
+}
+```
+
+**Success Response (200 OK):**
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "expiresAtUtc": "2026-10-16T20:03:45.6559945Z",
+  "agentId": 1,
+  "name": "Alex Turner",
+  "email": "alex.turner@northwind-support.example"
+}
+```
+
+**Failure Response (401 Unauthorized):**
+An unknown email, incorrect password, or inactive agent returns an identical generic 401 response:
+```http
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json; charset=utf-8
+
+{
+  "title": "Unauthorized",
+  "status": 401,
+  "detail": "Invalid email or password."
+}
+```
+
+#### 2. Current User Profile (`GET /api/auth/me`)
+Protected endpoint. Returns agent identity from validated JWT claims.
+
+**Request:**
+```http
+GET /api/auth/me HTTP/1.1
+Host: localhost:5043
+Authorization: Bearer <token>
+```
+
+**Success Response (200 OK):**
+```json
+{
+  "agentId": 1,
+  "name": "Alex Turner",
+  "email": "alex.turner@northwind-support.example"
+}
+```
+
+**Unauthenticated Response (401 Unauthorized):**
+Requests without a valid token receive `401 Unauthorized`.
+
+#### 3. Calling Protected Endpoints
+All existing application endpoints (`GET /api/tickets`, `POST /api/tickets`, `POST /api/tickets/{id}/escalate`, etc.) require a valid Bearer token in the `Authorization` header:
+
+```bash
+curl -X GET http://localhost:5043/api/tickets \
+  -H "Authorization: Bearer <token>"
+```
+
+Anonymous requests to any protected endpoint return `401 Unauthorized`. Login and Swagger are the only intended anonymous endpoints.
+
+---
+
+## Task 3.2 Frontend Authentication
+
+### Overview & Features Implemented
+Integrated backend Task 3.1 authentication into the React 19 / TypeScript application with centralized state, route protection, token attachment, and global 401 handling:
+
+| Feature | Component / File | Behavior & Contract |
+|---|---|---|
+| **Login Page** | `features/auth/LoginPage.tsx` | Dedicated `/login` route with email and password fields. Validates required fields and email syntax on the client before calling the API. Displays pending state, prevents double submission, presents clear error messages on 401 credential rejections or network failures, and redirects authenticated users. |
+| **Token Storage** | `api/client.ts` | Stores the JWT token and authenticated agent profile in `sessionStorage` (`auth_token`, `auth_user`). Centralized accessor and mutator helpers ensure consistent persistence across the application. Password is never stored. |
+| **Bearer Attachment** | `api/client.ts` | Automatically attaches `Authorization: Bearer <token>` to all authenticated API calls. Omitted for `/auth/login`. Restricted to internal API endpoints (`${baseUrl}${path}`) and never attached to external URLs. |
+| **Route Protection** | `features/auth/ProtectedRoute.tsx` | Guards private routes (`/tickets`, `/tickets/new`, `/tickets/:id`, `/customers`, `/customers/:id`). Redirects unauthenticated visitors to `/login`, capturing the full requested URL and query parameters. |
+| **Return Navigation** | `api/client.ts` · `LoginPage.tsx` | `getSafeReturnUrl` safely validates return destinations, rejecting external URLs, protocol-relative attacks (`//evil.com`), and `/login` loops. Upon login, smoothly returns the user to their requested destination or `/tickets`. |
+| **Agent Identity & Logout** | `App.tsx` · `features/auth/AuthProvider.tsx` | Displays the signed-in agent's name (`user.name`) in the top navigation header. "Sign out" button immediately wipes the session, resets React auth state, and navigates to `/login`. |
+| **Global 401 Handling** | `api/client.ts` · `features/auth/AuthProvider.tsx` | Intercepts HTTP 401 responses on authenticated requests, clears stored credentials, debounces concurrent redirect storms, and navigates to `/login` with the current path preserved. Normal login failures on `/auth/login` are exempted from redirection to display error banners. |
+| **Lightweight State** | `features/auth/AuthContext.ts` · `useAuth.ts` | Context-based authentication state initialized from `sessionStorage` on page reload. The backend remains the authority on token validity. |
+
+### Token Storage & Security Trade-offs
+The frontend stores the JWT access token and user profile in browser `sessionStorage`:
+
+- **Lifespan**: Scoped strictly to the browser tab or window. Closing the tab ends the session.
+- **CSRF Immunity**: Storing the token in memory/sessionStorage and sending it via the `Authorization: Bearer` header eliminates Cross-Site Request Forgery (CSRF) vulnerabilities common with cookie-based authentication.
+- **XSS Exposure Trade-off**:
+  > [!WARNING]
+  > **Security Trade-off**: Any data stored in `sessionStorage` or `localStorage` is accessible to JavaScript executing in the same origin. If a Cross-Site Scripting (XSS) vulnerability exists, the stored token can be accessed by malicious scripts.
+  > In high-security production deployments, using `HttpOnly`, `Secure`, and `SameSite=Strict` cookies issued by the backend prevents client-side script access to the token. For this assessment, `sessionStorage` was chosen as the simplest appropriate mechanism, providing tab isolation and stateless Bearer authorization without complex cookie synchronization or refresh token state machines.
+
+### Calling Authenticated Endpoints from the Web App
+All requests made through `request()` in `apps/web/src/api/client.ts` automatically retrieve the stored token from `sessionStorage` and attach it:
+```typescript
+if (token && path !== '/auth/login' && !headers['Authorization']) {
+  headers['Authorization'] = `Bearer ${token}`;
+}
+```
+
+### Verification & Tests Run
+- **Frontend Tests (`npm test --workspace apps/web`)**: 68 passed across 12 test suites (Vitest):
+  - `LoginPage.test.tsx` (9 tests): Form rendering, required field validation, email format checking, pending state and double-click prevention, rejected 401 credentials error display, network failure handling, session persistence, return navigation, and already-authenticated redirect.
+  - `AuthFlow.test.tsx` (4 tests): Protected route redirect to `/login` with return state, authenticated access, agent identity header display, logout session clearing, and global 401 redirect from authenticated requests.
+  - `client.test.ts` (11 tests): Storage helper methods, Bearer token attachment, skipping token on `/auth/login`, 401 session clearing and unauthorized handler invocation, exempting `/auth/login` from 401 logout, concurrent 401 debounce guard, and `getSafeReturnUrl` open-redirect security.
+  - Existing ticket, escalation, and SLA test suites (44 tests) all pass without regressions.
+- **TypeScript Typecheck (`npm run typecheck --workspace apps/web`)**: 0 errors.
+- **Vite Production Build (`npm run build --workspace apps/web`)**: Succeeded cleanly (built in 474ms).
+
+---
+
+## Task 4: Dockerise the API
+
+### Overview
+Containerised the .NET 10 Web API using a multi-stage Docker build, non-root runtime security, environment-based configuration, container health checks, and Docker Compose orchestration.
+
+| Requirement | Implementation Details |
+|---|---|
+| **Multi-Stage Build (DK-1)** | Built from repository root using .NET 10 SDK (`mcr.microsoft.com/dotnet/sdk:10.0`) for restore/publish and ASP.NET 10 runtime (`mcr.microsoft.com/dotnet/aspnet:10.0`) for execution. Copies `global.json`, `Directory.Build.props`, `Directory.Packages.props`, and `.csproj` files prior to `dotnet restore` to maximize Docker layer caching. |
+| **Docker Ignore (DK-2)** | Root `.dockerignore` excludes `bin/`, `obj/`, `node_modules/`, `.git/`, `.env*`, and `apps/web/`. |
+| **Runtime Security (DK-3)** | Runs as non-root user `app` (UID 1654). Binds to HTTP port `8080`. Excludes HTTPS certificates from the image. |
+| **Runtime Configuration (DK-4)** | Zero secrets or environment-specific configs baked into image. Injects `ConnectionStrings__Default`, `Jwt__SigningKey`, `Jwt__Issuer`, `Jwt__Audience`, `Jwt__LifetimeMinutes`, and `ASPNETCORE_ENVIRONMENT` at container runtime. |
+| **Compose Integration (DK-5)** | Added `api` service to `docker-compose.yml` published at `localhost:5080:8080`. Connects to SQL Server via Compose service name `sqlserver`. Enforces `depends_on: sqlserver: condition: service_healthy`. |
+| **Fresh Volume Startup (DK-6)** | Automatically applies EF Core migrations and seeds development data on startup when `ASPNETCORE_ENVIRONMENT=Development`. |
+| **Health Check (DK-7)** | Anonymous `GET /health` endpoint running `DatabaseHealthCheck` (`CanConnectAsync`). Configured via `app.MapHealthChecks("/health").AllowAnonymous()`. |
+| **Frontend Proxy (DK-8)** | Compatible with `VITE_API_PROXY_TARGET=http://localhost:5080 npm run web`. |
+
+### Docker Compose Commands
+
+```bash
+# Build and start both SQL Server and the API container
+docker compose up --build
+
+# Run in background (detached)
+docker compose up --build -d
+
+# Wipe database volume and rebuild cleanly
+docker compose down -v && docker compose up --build -d
+
+# Stop services
+docker compose down
+```
+
+### Health Check & Verification
+
+```bash
+# Verify health check endpoint (returns 200 OK with 'Healthy')
+curl -i http://localhost:5080/health
+
+# Verify non-root execution (returns 'app')
+docker compose exec api whoami
+
+# Test authenticated API endpoint through container
+curl -X POST http://localhost:5080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alex.turner@northwind-support.example","password":"DevPassword123!"}'
+```
+
+### Measured Image Sizes
+
+Based on actual `docker images` and `docker inspect` measurements:
+- **Build Stage (SDK)**: `mcr.microsoft.com/dotnet/sdk:10.0` — **1.3 GB** virtual size (351 MB compressed base layers).
+- **Runtime Base Image**: `mcr.microsoft.com/dotnet/aspnet:10.0` — **340 MB** virtual size (95.9 MB compressed base layers).
+- **Final API Image**: `northwind-support-api:latest` — **455 MB** virtual size (125 MB total layer footprint including published binaries and runtime).
+
+### NuGet Restore Cache Verification
+Verified by adding a trivial code comment to `DatabaseHealthCheck.cs` and running `docker compose build api`. Docker build output confirmed:
+```
+#10 [build 3/10] COPY global.json Directory.Build.props Directory.Packages.props ./ CACHED
+#11 [build 4/10] COPY apps/api/src/SupportDesk.Domain/... CACHED
+#12 [build 5/10] COPY apps/api/src/SupportDesk.Application/... CACHED
+#13 [build 6/10] COPY apps/api/src/SupportDesk.Infrastructure/... CACHED
+#14 [build 7/10] COPY apps/api/src/SupportDesk.Presentation/... CACHED
+#15 [build 8/10] RUN dotnet restore ... CACHED
+```
+Only code compilation (`dotnet publish`) re-executed, proving dependency layers remain fully cached.
+
+### Database Migrations: Development vs. Production Strategy
+- **Local Development**: In development mode (`ASPNETCORE_ENVIRONMENT=Development`), `app.MigrateAndSeedAsync()` runs automatically on application boot. This keeps the environment zero-touch and reproducible for local developers.
+- **Production Migration Strategy**: In production environments, running migrations inside the web application container on startup is strongly discouraged:
+  1. *Concurrency & Race Conditions*: Horizontally scaling multiple API replicas would cause concurrent instances to attempt schema mutations simultaneously.
+  2. *Least Privilege Security*: Production web applications should connect using a database user with minimal DML privileges (`SELECT`, `INSERT`, `UPDATE`, `DELETE`), not DDL privileges (`CREATE TABLE`, `ALTER TABLE`, `DROP`).
+  3. *Rollback & Audit Control*: Production database migrations must be decoupled from application startup and executed in a dedicated, auditable deployment step (such as a GitHub Actions workflow step, Azure DevOps release pipeline, or Kubernetes `Job` / init container) using `dotnet ef database update` or idempotent SQL migration bundles (`dotnet ef migrations script --idempotent`).
+
+### Connecting the Web App to the Containerised API
+To run the React development server against the containerised API:
+```bash
+# Terminal 1: Run containers
+docker compose up --build -d
+
+# Terminal 2: Run frontend proxying to port 5080
+VITE_API_PROXY_TARGET=http://localhost:5080 npm run web
+```
+The React application at `http://localhost:5173` proxies all `/api` requests to `http://localhost:5080`.
+
+---
+
 ## Quick start
+
 
 **Prerequisites:** .NET SDK 10 (`global.json`), Node.js 22 (`.nvmrc`; 20.19+ works), Docker.
 

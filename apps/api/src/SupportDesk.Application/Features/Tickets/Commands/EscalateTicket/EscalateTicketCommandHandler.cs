@@ -25,7 +25,8 @@ public sealed class EscalateTicketCommandHandler(
     IClock clock,
     SlaOptions slaOptions,
     GetTicketQueryHandler getTicket,
-    ILogger<EscalateTicketCommandHandler> logger)
+    ILogger<EscalateTicketCommandHandler> logger,
+    ICurrentUser? currentUser = null)
 {
     /// <exception cref="NotFoundException">Ticket does not exist.</exception>
     /// <exception cref="BusinessRuleViolationException">Ticket is Critical, Resolved, or Closed.</exception>
@@ -72,13 +73,18 @@ public sealed class EscalateTicketCommandHandler(
         var (newAgent, _) = AgentAssignmentPolicy.ReevaluateAgentForEscalation(
             ticket.AssignedAgentId, candidateWorkloads, category);
 
+        // G. Escalation actor: obtained from the authenticated user's JWT claims, not trusted from the request body.
+        var escalatedBy = (currentUser?.IsAuthenticated == true && !string.IsNullOrWhiteSpace(currentUser.FullName))
+            ? currentUser.FullName
+            : (!string.IsNullOrWhiteSpace(request.EscalatedBy) ? request.EscalatedBy : "Unknown Agent");
+
         // Domain method validates invariants and appends immutable TicketEscalation
         var escalation = ticket.Escalate(
             newPriority,
             newDueAtUtc,
             newAgent?.Id,
             request.Reason,
-            request.EscalatedBy,
+            escalatedBy,
             nowUtc);
 
         // Persist ticket updates and escalation row atomically

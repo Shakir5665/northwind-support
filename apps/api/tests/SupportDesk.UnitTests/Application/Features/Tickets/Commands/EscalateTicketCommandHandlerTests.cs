@@ -295,4 +295,35 @@ public class EscalateTicketCommandHandlerTests
         Assert.Equal(expectedDue, ticket.DueAtUtc);
         Assert.NotEqual(initialDue.AddHours(8), ticket.DueAtUtc);
     }
+
+    [Fact]
+    public async Task HandleAsync_WhenAuthenticatedUserPresent_RecordsAuthenticatedUserInEscalationHistory_IgnoringForgedActor()
+    {
+        var ticket = CreateTicket(priority: TicketPriority.Low);
+        _context.ExistingTicket(ticket);
+
+        var currentUserMock = new Moq.Mock<SupportDesk.Application.Abstractions.ICurrentUser>();
+        currentUserMock.Setup(u => u.IsAuthenticated).Returns(true);
+        currentUserMock.Setup(u => u.FullName).Returns("Authenticated Agent Priya");
+
+        var handlerWithAuth = new EscalateTicketCommandHandler(
+            _context.Tickets.Object,
+            _context.Customers.Object,
+            _context.Categories.Object,
+            _context.Agents.Object,
+            _context.UnitOfWork.Object,
+            _context.Clock,
+            _context.SlaOptions,
+            new SupportDesk.Application.Features.Tickets.Queries.GetTicket.GetTicketQueryHandler(_context.TicketQueries.Object),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<EscalateTicketCommandHandler>.Instance,
+            currentUserMock.Object);
+
+        var request = new EscalateTicketRequest("Valid escalation reason", "Forged Hacker Name");
+        var result = await handlerWithAuth.HandleAsync(ticket.Id, request, CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.NotNull(result.Escalation);
+        Assert.Equal("Authenticated Agent Priya", result.Escalation.EscalatedBy);
+        Assert.NotEqual("Forged Hacker Name", result.Escalation.EscalatedBy);
+    }
 }

@@ -15,9 +15,9 @@ public sealed class TicketTriageDto
 }
 
 /// <summary>
-/// Body of POST /api/tickets/{id}/escalate.
+/// Body of POST /api/tickets/{id}/escalate. EscalatedBy is optional and overridden by the authenticated agent.
 /// </summary>
-public sealed record EscalateTicketRequest(string Reason, string EscalatedBy);
+public sealed record EscalateTicketRequest(string Reason, string? EscalatedBy = null);
 
 /// <summary>
 /// A single ticket escalation history record.
