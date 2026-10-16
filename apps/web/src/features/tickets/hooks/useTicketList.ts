@@ -28,13 +28,22 @@ interface State {
 /** Owns the ticket list's filters and the data they produce. */
 export function useTicketList() {
   const [filters, setFilters] = useState<TicketFilters>(emptyFilters);
+  const [debouncedSearch, setDebouncedSearch] = useState(filters.search);
   const [state, setState] = useState<State>({ isLoading: true });
 
-  const load = async () => {
+  useEffect(() => {
+    const handle = window.setTimeout(() => {
+      setDebouncedSearch(filters.search);
+    }, DEBOUNCE_MS);
+
+    return () => window.clearTimeout(handle);
+  }, [filters.search]);
+
+  const load = async (activeFilters: TicketFilters) => {
     setState((current) => ({ ...current, isLoading: true, error: undefined }));
 
     try {
-      const data = await ticketsApi.getTickets(filters);
+      const data = await ticketsApi.getTickets(activeFilters);
       setState({ isLoading: false, data, error: undefined });
     } catch (error) {
       const message = error instanceof ApiError ? error.message : 'Unable to load tickets.';
@@ -42,17 +51,38 @@ export function useTicketList() {
     }
   };
 
+  // 2. Immediate fetch when debouncedSearch or any non-search filter changes
   useEffect(() => {
-    const handle = window.setTimeout(load, DEBOUNCE_MS);
-
-    return () => window.clearTimeout(handle);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- filters object identity changes every render
-  }, [filters.search, filters.page, filters.pageSize]);
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void load({ ...filters, search: debouncedSearch });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- activeFilters is composed from debouncedSearch and watched filter properties
+  }, [
+    debouncedSearch,
+    filters.status,
+    filters.priority,
+    filters.categoryId,
+    filters.customerId,
+    filters.assignedAgentId,
+    filters.unassignedOnly,
+    filters.page,
+    filters.pageSize,
+    filters.sortBy,
+    filters.sortDirection,
+  ]);
 
   const updateFilters = (patch: Partial<TicketFilters>) =>
     setFilters((current) => ({ ...current, ...patch, page: patch.page ?? 1 }));
 
-  const resetFilters = () => setFilters(emptyFilters);
+  const resetFilters = () => {
+    setFilters(emptyFilters);
+    setDebouncedSearch(emptyFilters.search);
+  };
 
-  return { filters, updateFilters, resetFilters, reload: load, ...state };
+  return {
+    filters,
+    updateFilters,
+    resetFilters,
+    reload: () => load({ ...filters, search: debouncedSearch }),
+    ...state,
+  };
 }

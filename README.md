@@ -41,6 +41,89 @@ Full requirements are in **[`ASSIGNMENT_CANDIDATE.md`](ASSIGNMENT_CANDIDATE.md)*
 
 ---
 
+## Task 1.1 Defect Fix (DEFECT-117)
+
+### Root Cause
+The data-fetching `useEffect` in `apps/web/src/features/tickets/hooks/useTicketList.ts` watched only `[filters.search, filters.page, filters.pageSize]`. All non-search filters (`status`, `priority`, `categoryId`, `customerId`, `assignedAgentId`, `unassignedOnly`, `sortBy`, `sortDirection`) were omitted from the dependency array. Because `updateFilters` defaults `page` to `1`, changing a non-search filter while on page 1 left all watched dependencies unchanged, preventing the effect from firing and sending an API request. Furthermore, the effect wrapped the request in a blanket 300 ms `setTimeout`, which would have delayed non-search filters even if they were watched.
+
+### Implementation
+- **Decoupled Search Debounce**: Added a dedicated `useEffect` that listens exclusively to `filters.search` and updates an independent `debouncedSearch` state after 300 ms (`DEBOUNCE_MS`), clearing pending timers on successive keystrokes.
+- **Immediate Non-Search Requests**: Configured the data-fetching `useEffect` to watch `debouncedSearch` alongside all individual non-search filter properties (`filters.status`, `filters.priority`, etc.). When any non-search filter changes, this effect runs synchronously without timer delay, calling `ticketsApi.getTickets({ ...filters, search: debouncedSearch })`.
+- **Why Search Remains Debounced While Other Filters Are Immediate**: Keystrokes update `filters.search` immediately (keeping the search input responsive) but do not trigger data-fetching until `debouncedSearch` settles after 300 ms. Meanwhile, non-search filter changes update their respective state immediately and trigger the data-fetching effect right away using the current settled `debouncedSearch` and new filter value.
+- **Immediate Reset & Reload**: Updated `resetFilters` to reset both `filters` and `debouncedSearch` synchronously, and updated `reload` to query using active filters with `debouncedSearch`.
+
+### Verification & Tests Run
+- **Automated Regression Tests**:
+  - `npm run test --workspace apps/web`: 6 tests passing across 2 files in Vitest.
+  - Added 4 regression tests in `apps/web/src/features/tickets/hooks/useTicketList.test.ts` verifying:
+    1. Changing a non-search filter (`status`) triggers `getTickets` immediately without advancing timers.
+    2. Changing a filter while on a later page (e.g., page 2) triggers immediately and resets `page` to 1.
+    3. Typing in `search` delays the request by 300 ms, while subsequently changing `status` triggers immediately and preserves active search text.
+    4. Resetting filters immediately triggers a request with default filters.
+- **Code Quality**:
+  - `npm run lint --workspace apps/web` passed with 0 errors and 0 warnings.
+  - `npm run typecheck --workspace apps/web` passed with 0 errors.
+
+---
+
+## Task 1.2 Server-Side Filtering
+
+### Original Defect
+`GET /api/tickets` bound query string parameters into `TicketQuery`, but `TicketQueries.GetPagedAsync` did not apply them to the database query. It executed `CountAsync` and `ApplySort().Skip().Take()` on the unfiltered `TicketsWithLabels()` set, returning the entire ticket table with a table-wide total count regardless of requested filters.
+
+### Filtering Strategy
+- **Centralized `ApplyFilters` on `IQueryable<TicketWithLabels>`**: All filters are conditionally applied via `.Where()` clauses on `IQueryable` before executing any query against the database.
+- **Why `IQueryable`**: Ensures EF Core translates all filter criteria directly into native SQL `WHERE` clauses on the database server. No in-memory filtering (`ToList` or `AsEnumerable`) occurs, preserving `AsNoTracking` performance.
+- **Single Source for Count and Paged Slices**: Both `totalCount` (`CountAsync`) and the paged item slice (`ApplySort().Skip().Take().ToListAsync()`) branch from the exact same filtered `IQueryable`. If `totalCount` were evaluated without filters, pagination controls in the client would reflect total table rows rather than the filtered subset, breaking page count calculations.
+- **Filter Semantics**:
+  - Exact matching on `status`, `priority`, `categoryId`, `customerId`, and `assignedAgentId`.
+  - `unassignedOnly=true` filters for `AssignedAgentId IS NULL`. When combined with `assignedAgentId`, AND logic ensures zero records match.
+  - `search` is trimmed, ignored when blank, and tests `Title`, `Reference`, or `Customer.Name` with OR conditions.
+  - Independent filters combine using logical AND.
+
+### Captured Generated SQL
+Verified in integration tests via EF Core command execution logging. For a query with `status=Open`, `priority=Critical`, and `search=VPN`:
+
+**Count Query:**
+```sql
+SELECT COUNT(*)
+FROM "Tickets" AS "t"
+INNER JOIN "Customers" AS "c" ON "t"."CustomerId" = "c"."Id"
+INNER JOIN "Categories" AS "c0" ON "t"."CategoryId" = "c0"."Id"
+LEFT JOIN "Agents" AS "a" ON "t"."AssignedAgentId" = "a"."Id"
+WHERE "t"."Status" = @query_Status_Value AND "t"."Priority" = @query_Priority_Value AND (instr("t"."Title", @search) > 0 OR instr("t"."Reference", @search) > 0 OR instr("c"."Name", @search) > 0)
+```
+
+**Paged Query:**
+```sql
+SELECT "t"."Id", "t"."Reference", "t"."Title", "t"."Status", "t"."Priority", "c"."Id", "c"."Name", "c"."Tier", "c0"."Id", "c0"."Name", "a"."Id" IS NULL, "a"."Id", "a"."FullName", "t"."CreatedAtUtc", "t"."UpdatedAtUtc", "t"."DueAtUtc", "t"."ResolvedAtUtc"
+FROM "Tickets" AS "t"
+INNER JOIN "Customers" AS "c" ON "t"."CustomerId" = "c"."Id"
+INNER JOIN "Categories" AS "c0" ON "t"."CategoryId" = "c0"."Id"
+LEFT JOIN "Agents" AS "a" ON "t"."AssignedAgentId" = "a"."Id"
+WHERE "t"."Status" = @query_Status_Value AND "t"."Priority" = @query_Priority_Value AND (instr("t"."Title", @search) > 0 OR instr("t"."Reference", @search) > 0 OR instr("c"."Name", @search) > 0)
+ORDER BY "t"."CreatedAtUtc" DESC, "t"."Id" DESC
+LIMIT @p7 OFFSET @p
+```
+*(On SQL Server, paging maps to `OFFSET @p ROWS FETCH NEXT @p7 ROWS ONLY` and substring matching maps to collation-aware string comparisons).*
+
+### Verification & Regression Tests Run
+- Added 16 tests in `SupportDesk.UnitTests/Infrastructure/Queries/TicketQueriesTests.cs` using an in-memory SQLite database:
+  - Exact match for each individual filter (`status`, `priority`, `categoryId`, `customerId`, `assignedAgentId`).
+  - `unassignedOnly=true` returns only unassigned tickets; combined with `assignedAgentId` returns empty.
+  - Search matching on title, reference, and customer name; trimmed whitespace; blank search ignored.
+  - Multi-filter AND combination.
+  - Paging consistency: `totalCount`, `totalPages`, and distinct slices on filtered data.
+  - Generated SQL command inspection confirming database-side filtering.
+- `dotnet test apps/api/tests/SupportDesk.UnitTests`: 42 passed (16 query tests + 26 existing unit tests).
+- `dotnet format apps/api/src/SupportDesk.Infrastructure --verify-no-changes`: 0 formatting changes.
+
+### Known Limitations
+- Task 2 SLA status filtering (`slaStatus`) is not yet implemented.
+- Substring search uses database pattern matching (`Contains` / `LIKE`); full-text search indexing is out of scope.
+
+---
+
 ## Quick start
 
 **Prerequisites:** .NET SDK 10 (`global.json`), Node.js 22 (`.nvmrc`; 20.19+ works), Docker.
