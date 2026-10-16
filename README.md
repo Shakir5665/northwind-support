@@ -66,6 +66,64 @@ The data-fetching `useEffect` in `apps/web/src/features/tickets/hooks/useTicketL
 
 ---
 
+## Task 1.2 Server-Side Filtering
+
+### Original Defect
+`GET /api/tickets` bound query string parameters into `TicketQuery`, but `TicketQueries.GetPagedAsync` did not apply them to the database query. It executed `CountAsync` and `ApplySort().Skip().Take()` on the unfiltered `TicketsWithLabels()` set, returning the entire ticket table with a table-wide total count regardless of requested filters.
+
+### Filtering Strategy
+- **Centralized `ApplyFilters` on `IQueryable<TicketWithLabels>`**: All filters are conditionally applied via `.Where()` clauses on `IQueryable` before executing any query against the database.
+- **Why `IQueryable`**: Ensures EF Core translates all filter criteria directly into native SQL `WHERE` clauses on the database server. No in-memory filtering (`ToList` or `AsEnumerable`) occurs, preserving `AsNoTracking` performance.
+- **Single Source for Count and Paged Slices**: Both `totalCount` (`CountAsync`) and the paged item slice (`ApplySort().Skip().Take().ToListAsync()`) branch from the exact same filtered `IQueryable`. If `totalCount` were evaluated without filters, pagination controls in the client would reflect total table rows rather than the filtered subset, breaking page count calculations.
+- **Filter Semantics**:
+  - Exact matching on `status`, `priority`, `categoryId`, `customerId`, and `assignedAgentId`.
+  - `unassignedOnly=true` filters for `AssignedAgentId IS NULL`. When combined with `assignedAgentId`, AND logic ensures zero records match.
+  - `search` is trimmed, ignored when blank, and tests `Title`, `Reference`, or `Customer.Name` with OR conditions.
+  - Independent filters combine using logical AND.
+
+### Captured Generated SQL
+Verified in integration tests via EF Core command execution logging. For a query with `status=Open`, `priority=Critical`, and `search=VPN`:
+
+**Count Query:**
+```sql
+SELECT COUNT(*)
+FROM "Tickets" AS "t"
+INNER JOIN "Customers" AS "c" ON "t"."CustomerId" = "c"."Id"
+INNER JOIN "Categories" AS "c0" ON "t"."CategoryId" = "c0"."Id"
+LEFT JOIN "Agents" AS "a" ON "t"."AssignedAgentId" = "a"."Id"
+WHERE "t"."Status" = @query_Status_Value AND "t"."Priority" = @query_Priority_Value AND (instr("t"."Title", @search) > 0 OR instr("t"."Reference", @search) > 0 OR instr("c"."Name", @search) > 0)
+```
+
+**Paged Query:**
+```sql
+SELECT "t"."Id", "t"."Reference", "t"."Title", "t"."Status", "t"."Priority", "c"."Id", "c"."Name", "c"."Tier", "c0"."Id", "c0"."Name", "a"."Id" IS NULL, "a"."Id", "a"."FullName", "t"."CreatedAtUtc", "t"."UpdatedAtUtc", "t"."DueAtUtc", "t"."ResolvedAtUtc"
+FROM "Tickets" AS "t"
+INNER JOIN "Customers" AS "c" ON "t"."CustomerId" = "c"."Id"
+INNER JOIN "Categories" AS "c0" ON "t"."CategoryId" = "c0"."Id"
+LEFT JOIN "Agents" AS "a" ON "t"."AssignedAgentId" = "a"."Id"
+WHERE "t"."Status" = @query_Status_Value AND "t"."Priority" = @query_Priority_Value AND (instr("t"."Title", @search) > 0 OR instr("t"."Reference", @search) > 0 OR instr("c"."Name", @search) > 0)
+ORDER BY "t"."CreatedAtUtc" DESC, "t"."Id" DESC
+LIMIT @p7 OFFSET @p
+```
+*(On SQL Server, paging maps to `OFFSET @p ROWS FETCH NEXT @p7 ROWS ONLY` and substring matching maps to collation-aware string comparisons).*
+
+### Verification & Regression Tests Run
+- Added 16 tests in `SupportDesk.UnitTests/Infrastructure/Queries/TicketQueriesTests.cs` using an in-memory SQLite database:
+  - Exact match for each individual filter (`status`, `priority`, `categoryId`, `customerId`, `assignedAgentId`).
+  - `unassignedOnly=true` returns only unassigned tickets; combined with `assignedAgentId` returns empty.
+  - Search matching on title, reference, and customer name; trimmed whitespace; blank search ignored.
+  - Multi-filter AND combination.
+  - Paging consistency: `totalCount`, `totalPages`, and distinct slices on filtered data.
+  - Generated SQL command inspection confirming database-side filtering.
+- `dotnet test apps/api/tests/SupportDesk.UnitTests`: 42 passed (16 query tests + 26 existing unit tests).
+- `dotnet format apps/api/src/SupportDesk.Infrastructure --verify-no-changes`: 0 formatting changes.
+
+### Known Limitations
+- Task 2 SLA status filtering (`slaStatus`) is not yet implemented.
+- Substring search uses database pattern matching (`Contains` / `LIKE`); full-text search indexing is out of scope.
+
+---
+
 ## Quick start
 
 **Prerequisites:** .NET SDK 10 (`global.json`), Node.js 22 (`.nvmrc`; 20.19+ works), Docker.
