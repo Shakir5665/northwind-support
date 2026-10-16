@@ -170,3 +170,45 @@ Integrated the Task 2.1 business rules into the backend Web API, persistence lay
   - Confirmed Clean Architecture layer dependencies are maintained.
   - Confirmed EF Core persistence model matches the latest migration against SQL Server provider without pending changes.
 - **Frontend Tests (`apps/web`)**: 6 passed across 2 test suites, verifying API contract compatibility.
+
+---
+
+## Task 2.3 Frontend Business Rules Integration
+
+### Overview & Delivered Features
+
+Integrated the backend Task 2.2 business rules, API contracts, and triage/escalation workflows into the React 19 / TypeScript frontend under `apps/web/src/features/tickets`:
+
+| Requirement | Component / Hook | Delivered Behavior |
+|---|---|---|
+| **Req A: SLA Indicator** | `SlaIndicator.tsx`, `SlaCell.tsx`, `TicketSummary.tsx` | One reusable, fully typed component representing all 5 SLA states (`WithinSla`, `AtRisk`, `Breached`, `Met`, `NotApplicable`). Used in both ticket list and ticket detail summary. Conveys status using symbols, text labels, and color badges with accessible `aria-label`s. |
+| **Req B: SLA Status Filter** | `TicketFilters.tsx`, `useTicketList.ts`, `api/tickets.ts` | Filter dropdown with friendly labels ("All SLA statuses", "Within SLA", "At risk", "Breached", "Met", "No SLA"). Sends `slaStatus` as query parameter, combines with existing filters via AND semantics, resets pagination to page 1 on filter changes, and omits the parameter when cleared. |
+| **Req C: Escalation Panel** | `EscalationPanel.tsx`, `TicketDetailPage.tsx` | Submits `POST /api/tickets/{id}/escalate` with `reason` and `escalatedBy`. Client-side validation: reason 5–500 characters, actor non-empty $\le 100$ characters. Disables button while pending, prevents double submissions, handles HTTP 400/404/409 errors, and updates ticket in place on success. |
+| **Req D: Escalation History** | `EscalationHistory.tsx`, `useTicketEscalations.ts` | Fetches `GET /api/tickets/{id}/escalations` newest-first. Renders before/after priority transitions, resolved agent names (or "Unassigned"), formatted due dates (or "No due date"), reason, actor, and formatted timestamps. Includes loading, error, and empty states. |
+| **Req E: Creation Triage Result** | `CreateTicketPage.tsx` | Post-creation confirmation card displaying structured triage decision: applied priority + reason, calculated SLA due date + reason, assigned agent + reason (or unassigned explanation). |
+| **Req F: Escalation Availability** | `EscalationPanel.tsx` | Disables/hides escalation controls when ticket is Critical, Resolved, or Closed with explanatory messages. Robustly handles server-side 409 responses for stale UI states. |
+| **Req G: Strict Type Safety** | `apps/web/src/types/api.ts` | Fully typed models matching backend DTOs (`TicketTriage`, `TicketEscalation`, `EscalateTicketPayload`, `EscalationResponse`). Strictly zero `any` and zero `@ts-ignore` across all touched code and test files. |
+
+### Architecture & Design Decisions
+
+- **Single Reusable SLA Component**: `SlaIndicator` standardizes SLA badge rendering across both list rows (`SlaCell`) and the detail panel (`TicketSummary`), ensuring visual consistency and centralized accessibility attributes.
+- **Backend-Driven Filtering & Pagination**: The SLA filter passes directly through `buildQuery` as `slaStatus` to the backend SQL query, letting SQL Server compute accurate filtered totals and pagination slices without in-memory evaluation.
+- **In-Place Reactive Refresh**: Successful escalation invokes `setData(response.ticket)` and `escalations.reload()`, updating priority, due date, SLA badge, and escalation history without full-page reloads.
+- **Accessibility & Contrast**: Badges combine distinct tones with textual status and symbols (`✓ Within SLA`, `⏳ At risk`, `✕ Breached`, `★ Met`, `— No SLA`), satisfying WCAG requirements where color is not the sole information channel.
+
+### Verification & Testing Summary
+
+1. **Vitest Unit & Integration Tests (`apps/web`)**: 41 passed, 0 failed across 9 test files.
+   - `SlaIndicator.test.tsx` (5 tests): Verifies all 5 statuses, visible text, accessibility labels, and badge tone classes.
+   - `useTicketList.test.ts` (7 tests): Debounce behavior, immediate non-search filter updates, pagination reset to page 1 on `slaStatus` change, and multi-filter combination.
+   - `TicketFilters.test.tsx` (4 tests): Dropdown rendering, friendly labels, selection callback, clearing callback (undefined), and filter combination.
+   - `EscalationPanel.test.tsx` (11 tests): Client-side length validation (5-500 chars), missing actor validation, pending state and double-click prevention, HTTP 400/404/409 error rendering, network failure handling, and Critical/Resolved/Closed availability rules.
+   - `EscalationHistory.test.tsx` (4 tests): Loading spinner, error retry callback, empty history notice, and before/after transition display with null agent/date handling.
+   - `CreateTicketPage.test.tsx` (3 tests): Assigned ticket triage decision display, unassigned explanation display, and reset flow.
+   - `TicketDetailPage.test.tsx` (2 tests): Detail rendering and post-escalation refresh without full page reload.
+   - `api/tickets.test.ts` (4 tests): Query parameter serialization and HTTP endpoint contracts.
+   - `TicketTable.test.tsx` (1 test): List table row rendering with SLA status.
+2. **TypeScript Compilation (`tsc -b --noEmit`)**: 0 errors.
+3. **ESLint (`eslint .`)**: 0 errors, 0 warnings.
+4. **Vite Production Bundle (`npm run build`)**: Succeeded cleanly (built in 710ms).
+

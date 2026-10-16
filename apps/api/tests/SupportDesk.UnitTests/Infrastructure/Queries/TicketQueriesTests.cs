@@ -422,13 +422,30 @@ public sealed class TicketQueriesTests : IDisposable
     {
         var now = FixedClock.DefaultNow;
         // Created 3h ago, due in 1h. Window = 4h. Remaining = 1h (25% remaining) -> AtRisk
-        var tAtRisk = Ticket.Raise("TCK-ATRISK", "Almost late", "Desc", _customer1.Id, _category1.Id, TicketPriority.Medium, now.AddHours(-3), now.AddHours(1), null);
-        _db.Add(tAtRisk);
+        var tAtRiskExact = Ticket.Raise("TCK-ATRISK-EXACT", "At 25% threshold", "Desc", _customer1.Id, _category1.Id, TicketPriority.Medium, now.AddHours(-3), now.AddHours(1), null);
+        // Created 7h ago, due in 1h. Window = 8h. Remaining = 1h (12.5% remaining < 25%) -> AtRisk
+        var tAtRiskBelow = Ticket.Raise("TCK-ATRISK-BELOW", "Below 25% threshold", "Desc", _customer1.Id, _category1.Id, TicketPriority.High, now.AddHours(-7), now.AddHours(1), null);
+        // Created 1h ago, due in 3h. Window = 4h. Remaining = 3h (75% remaining) -> WithinSla (must be excluded)
+        var tWithin = Ticket.Raise("TCK-WITHIN-EXCL", "Plenty of time", "Desc", _customer1.Id, _category1.Id, TicketPriority.Low, now.AddHours(-1), now.AddHours(3), null);
+        // Breached: Due 1h ago, open (must be excluded)
+        var tBreached = Ticket.Raise("TCK-BREACHED-EXCL", "Breached", "Desc", _customer1.Id, _category1.Id, TicketPriority.High, now.AddHours(-5), now.AddHours(-1), null);
+        // Met: Resolved before due date (must be excluded)
+        var tResolved = Ticket.Raise("TCK-RESOLVED-EXCL", "Resolved", "Desc", _customer1.Id, _category1.Id, TicketPriority.Medium, now.AddHours(-3), now.AddHours(1), null);
+        tResolved.ChangeStatus(TicketStatus.Resolved, now.AddHours(-1));
+        // No SLA: DueAtUtc is null (must be excluded)
+        var tNoSla = Ticket.Raise("TCK-NOSLA-EXCL", "No SLA", "Desc", _customer1.Id, _category1.Id, TicketPriority.Low, now.AddHours(-1), null, null);
+
+        _db.AddRange(tAtRiskExact, tAtRiskBelow, tWithin, tBreached, tResolved, tNoSla);
         await _db.SaveChangesAsync();
 
         var result = await _sut.GetPagedAsync(new TicketQuery { SlaStatus = SlaStatus.AtRisk }, CancellationToken.None);
 
-        Assert.Contains(result.Items, item => item.Reference == "TCK-ATRISK");
+        Assert.Contains(result.Items, item => item.Reference == "TCK-ATRISK-EXACT");
+        Assert.Contains(result.Items, item => item.Reference == "TCK-ATRISK-BELOW");
+        Assert.DoesNotContain(result.Items, item => item.Reference == "TCK-WITHIN-EXCL");
+        Assert.DoesNotContain(result.Items, item => item.Reference == "TCK-BREACHED-EXCL");
+        Assert.DoesNotContain(result.Items, item => item.Reference == "TCK-RESOLVED-EXCL");
+        Assert.DoesNotContain(result.Items, item => item.Reference == "TCK-NOSLA-EXCL");
         Assert.All(result.Items, item => Assert.Equal(SlaStatus.AtRisk, item.SlaStatus));
     }
 
@@ -437,13 +454,27 @@ public sealed class TicketQueriesTests : IDisposable
     {
         var now = FixedClock.DefaultNow;
         // Created 1h ago, due in 3h. Window = 4h. Remaining = 3h (75% remaining) -> WithinSla
-        var tWithin = Ticket.Raise("TCK-WITHIN", "Plenty of time", "Desc", _customer1.Id, _category1.Id, TicketPriority.Low, now.AddHours(-1), now.AddHours(3), null);
-        _db.Add(tWithin);
+        var tWithin = Ticket.Raise("TCK-WITHIN-INCL", "Plenty of time", "Desc", _customer1.Id, _category1.Id, TicketPriority.Low, now.AddHours(-1), now.AddHours(3), null);
+        // Created 3h ago, due in 1h. Window = 4h. Remaining = 1h (25% remaining) -> AtRisk (must be excluded)
+        var tAtRisk = Ticket.Raise("TCK-ATRISK-EXCL", "Almost late", "Desc", _customer1.Id, _category1.Id, TicketPriority.Medium, now.AddHours(-3), now.AddHours(1), null);
+        // Breached: Due 1h ago, open (must be excluded)
+        var tBreached = Ticket.Raise("TCK-BREACH-EXCL", "Breached", "Desc", _customer1.Id, _category1.Id, TicketPriority.High, now.AddHours(-5), now.AddHours(-1), null);
+        // Met: Resolved before due date (must be excluded)
+        var tResolved = Ticket.Raise("TCK-MET-EXCL", "Resolved", "Desc", _customer1.Id, _category1.Id, TicketPriority.Medium, now.AddHours(-3), now.AddHours(1), null);
+        tResolved.ChangeStatus(TicketStatus.Resolved, now.AddHours(-1));
+        // No SLA: DueAtUtc is null (must be excluded)
+        var tNoSla = Ticket.Raise("TCK-NULL-EXCL", "No SLA", "Desc", _customer1.Id, _category1.Id, TicketPriority.Low, now.AddHours(-1), null, null);
+
+        _db.AddRange(tWithin, tAtRisk, tBreached, tResolved, tNoSla);
         await _db.SaveChangesAsync();
 
         var result = await _sut.GetPagedAsync(new TicketQuery { SlaStatus = SlaStatus.WithinSla }, CancellationToken.None);
 
-        Assert.Contains(result.Items, item => item.Reference == "TCK-WITHIN");
+        Assert.Contains(result.Items, item => item.Reference == "TCK-WITHIN-INCL");
+        Assert.DoesNotContain(result.Items, item => item.Reference == "TCK-ATRISK-EXCL");
+        Assert.DoesNotContain(result.Items, item => item.Reference == "TCK-BREACH-EXCL");
+        Assert.DoesNotContain(result.Items, item => item.Reference == "TCK-MET-EXCL");
+        Assert.DoesNotContain(result.Items, item => item.Reference == "TCK-NULL-EXCL");
         Assert.All(result.Items, item => Assert.Equal(SlaStatus.WithinSla, item.SlaStatus));
     }
 

@@ -3,8 +3,10 @@ import { Link, useNavigate } from 'react-router-dom';
 import { ErrorMessage } from '../../components/ErrorMessage';
 import { Spinner } from '../../components/Spinner';
 import { useReferenceData } from '../../hooks/useReferenceData';
+import { formatDateTime } from '../../lib/format';
 import type { TicketDetail } from '../../types/api';
 import { CreateTicketForm } from './components/CreateTicketForm';
+import { PriorityBadge } from './components/TicketBadges';
 
 export function CreateTicketPage() {
   const reference = useReferenceData();
@@ -33,6 +35,42 @@ export function CreateTicketPage() {
           <p>
             Raised <strong>{created.reference}</strong> for {created.customer.name}.
           </p>
+
+          <div className="triage-result" aria-label="Automatic triage results">
+            <h3>Triage Decision</h3>
+            <dl className="summary">
+              <div>
+                <dt>Effective Priority</dt>
+                <dd>
+                  <PriorityBadge priority={created.priority} />
+                  {created.triage?.priorityReason && (
+                    <span className="summary__note">{created.triage.priorityReason}</span>
+                  )}
+                </dd>
+              </div>
+
+              <div>
+                <dt>SLA Due Date</dt>
+                <dd>
+                  {created.dueAtUtc ? formatDateTime(created.dueAtUtc) : 'No due date'}
+                  {created.triage?.slaReason && (
+                    <span className="summary__note">{created.triage.slaReason}</span>
+                  )}
+                </dd>
+              </div>
+
+              <div>
+                <dt>Assigned Agent</dt>
+                <dd>
+                  {created.assignedAgent ? created.assignedAgent.fullName : 'Unassigned'}
+                  {created.triage?.assignmentReason && (
+                    <span className="summary__note">{created.triage.assignmentReason}</span>
+                  )}
+                </dd>
+              </div>
+            </dl>
+          </div>
+
           <div className="button-row">
             <button
               type="button"

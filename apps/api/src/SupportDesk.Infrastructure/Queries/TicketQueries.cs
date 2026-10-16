@@ -22,8 +22,9 @@ public sealed class TicketQueries(SupportDbContext db, IClock clock) : ITicketQu
     public async Task<PagedResult<TicketListItemDto>> GetPagedAsync(TicketQuery query, CancellationToken ct)
     {
         var now = clock.UtcNow;
+        var isSqlServer = db.Database.IsSqlServer();
 
-        var tickets = ApplyFilters(TicketsWithLabels(), query, now);
+        var tickets = ApplyFilters(TicketsWithLabels(), query, now, isSqlServer);
 
         var totalCount = await tickets.CountAsync(ct);
 
@@ -147,7 +148,8 @@ public sealed class TicketQueries(SupportDbContext db, IClock clock) : ITicketQu
     private static IQueryable<TicketWithLabels> ApplyFilters(
         IQueryable<TicketWithLabels> source,
         TicketQuery query,
-        DateTime nowUtc)
+        DateTime nowUtc,
+        bool isSqlServer)
     {
         if (query.Status.HasValue)
         {
@@ -190,30 +192,65 @@ public sealed class TicketQueries(SupportDbContext db, IClock clock) : ITicketQu
 
         if (query.SlaStatus.HasValue)
         {
-            var nowTicks = nowUtc.Ticks;
-            source = query.SlaStatus.Value switch
+            if (isSqlServer)
             {
-                SlaStatus.NotApplicable => source.Where(x => x.Ticket.DueAtUtc == null),
-                SlaStatus.Met => source.Where(x =>
-                    x.Ticket.DueAtUtc != null &&
-                    x.Ticket.ResolvedAtUtc != null &&
-                    x.Ticket.ResolvedAtUtc <= x.Ticket.DueAtUtc),
-                SlaStatus.Breached => source.Where(x =>
-                    x.Ticket.DueAtUtc != null &&
-                    ((x.Ticket.ResolvedAtUtc != null && x.Ticket.ResolvedAtUtc > x.Ticket.DueAtUtc) ||
-                     (x.Ticket.ResolvedAtUtc == null && nowUtc > x.Ticket.DueAtUtc))),
-                SlaStatus.AtRisk => source.Where(x =>
-                    x.Ticket.DueAtUtc != null &&
-                    x.Ticket.ResolvedAtUtc == null &&
-                    nowUtc <= x.Ticket.DueAtUtc &&
-                    (x.Ticket.DueAtUtc.Value.Ticks - nowTicks) * 4 <= (x.Ticket.DueAtUtc.Value.Ticks - x.Ticket.CreatedAtUtc.Ticks)),
-                SlaStatus.WithinSla => source.Where(x =>
-                    x.Ticket.DueAtUtc != null &&
-                    x.Ticket.ResolvedAtUtc == null &&
-                    nowUtc <= x.Ticket.DueAtUtc &&
-                    (x.Ticket.DueAtUtc.Value.Ticks - nowTicks) * 4 > (x.Ticket.DueAtUtc.Value.Ticks - x.Ticket.CreatedAtUtc.Ticks)),
-                _ => source
-            };
+                source = query.SlaStatus.Value switch
+                {
+                    SlaStatus.NotApplicable => source.Where(x => x.Ticket.DueAtUtc == null),
+                    SlaStatus.Met => source.Where(x =>
+                        x.Ticket.DueAtUtc != null &&
+                        x.Ticket.ResolvedAtUtc != null &&
+                        x.Ticket.ResolvedAtUtc <= x.Ticket.DueAtUtc),
+                    SlaStatus.Breached => source.Where(x =>
+                        x.Ticket.DueAtUtc != null &&
+                        ((x.Ticket.ResolvedAtUtc != null && x.Ticket.ResolvedAtUtc > x.Ticket.DueAtUtc) ||
+                         (x.Ticket.ResolvedAtUtc == null && nowUtc > x.Ticket.DueAtUtc))),
+                    SlaStatus.AtRisk => source.Where(x =>
+                        x.Ticket.DueAtUtc != null &&
+                        x.Ticket.ResolvedAtUtc == null &&
+                        nowUtc <= x.Ticket.DueAtUtc &&
+                        EF.Functions.DateDiffSecond(x.Ticket.CreatedAtUtc, x.Ticket.DueAtUtc.Value) > 0 &&
+                        (long)EF.Functions.DateDiffSecond(nowUtc, x.Ticket.DueAtUtc.Value) * 4L <=
+                        (long)EF.Functions.DateDiffSecond(x.Ticket.CreatedAtUtc, x.Ticket.DueAtUtc.Value)),
+                    SlaStatus.WithinSla => source.Where(x =>
+                        x.Ticket.DueAtUtc != null &&
+                        x.Ticket.ResolvedAtUtc == null &&
+                        nowUtc <= x.Ticket.DueAtUtc &&
+                        (EF.Functions.DateDiffSecond(x.Ticket.CreatedAtUtc, x.Ticket.DueAtUtc.Value) <= 0 ||
+                         (long)EF.Functions.DateDiffSecond(nowUtc, x.Ticket.DueAtUtc.Value) * 4L >
+                         (long)EF.Functions.DateDiffSecond(x.Ticket.CreatedAtUtc, x.Ticket.DueAtUtc.Value))),
+                    _ => source
+                };
+            }
+            else
+            {
+                var nowTicks = nowUtc.Ticks;
+                source = query.SlaStatus.Value switch
+                {
+                    SlaStatus.NotApplicable => source.Where(x => x.Ticket.DueAtUtc == null),
+                    SlaStatus.Met => source.Where(x =>
+                        x.Ticket.DueAtUtc != null &&
+                        x.Ticket.ResolvedAtUtc != null &&
+                        x.Ticket.ResolvedAtUtc <= x.Ticket.DueAtUtc),
+                    SlaStatus.Breached => source.Where(x =>
+                        x.Ticket.DueAtUtc != null &&
+                        ((x.Ticket.ResolvedAtUtc != null && x.Ticket.ResolvedAtUtc > x.Ticket.DueAtUtc) ||
+                         (x.Ticket.ResolvedAtUtc == null && nowUtc > x.Ticket.DueAtUtc))),
+                    SlaStatus.AtRisk => source.Where(x =>
+                        x.Ticket.DueAtUtc != null &&
+                        x.Ticket.ResolvedAtUtc == null &&
+                        nowUtc <= x.Ticket.DueAtUtc &&
+                        x.Ticket.DueAtUtc.Value.Ticks > x.Ticket.CreatedAtUtc.Ticks &&
+                        (x.Ticket.DueAtUtc.Value.Ticks - nowTicks) * 4 <= (x.Ticket.DueAtUtc.Value.Ticks - x.Ticket.CreatedAtUtc.Ticks)),
+                    SlaStatus.WithinSla => source.Where(x =>
+                        x.Ticket.DueAtUtc != null &&
+                        x.Ticket.ResolvedAtUtc == null &&
+                        nowUtc <= x.Ticket.DueAtUtc &&
+                        (x.Ticket.DueAtUtc.Value.Ticks <= x.Ticket.CreatedAtUtc.Ticks ||
+                         (x.Ticket.DueAtUtc.Value.Ticks - nowTicks) * 4 > (x.Ticket.DueAtUtc.Value.Ticks - x.Ticket.CreatedAtUtc.Ticks))),
+                    _ => source
+                };
+            }
         }
 
         return source;

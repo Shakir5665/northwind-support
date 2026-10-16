@@ -185,6 +185,38 @@ Integrated Task 2.1 domain business rules with Web API endpoints, EF Core SQL Se
 
 ---
 
+## Task 2.3 Frontend Business Rules Integration
+
+### Overview & Features Implemented
+Integrated Task 2.2 business rules and backend endpoints into the React 19 / TypeScript web app under `apps/web/src/features/tickets`:
+
+| Feature | Component / File | Behavior & Contract |
+|---|---|---|
+| **SLA Indicator** | `SlaIndicator.tsx` | Single reusable component used across ticket table (`SlaCell.tsx`) and detail summary (`TicketSummary.tsx`). Fully types all 5 domain states (`WithinSla`, `AtRisk`, `Breached`, `Met`, `NotApplicable`) with text, symbols, badges, and accessible labels. |
+| **SLA Status Filter** | `TicketFilters.tsx` · `useTicketList.ts` | Filter bar dropdown sending `slaStatus` query parameter to backend. Seamlessly combines with existing filters, resets page to 1 on change, and omits the query parameter when cleared. |
+| **Escalation Panel** | `EscalationPanel.tsx` · `TicketDetailPage.tsx` | Detail page panel calling `POST /api/tickets/{id}/escalate`. Validates reason (5–500 chars) and actor ($\le 100$ chars) on the client, prevents rapid multi-clicks, displays pending state, handles 400/404/409 errors, and refreshes state in place without full page reload. |
+| **Escalation History** | `EscalationHistory.tsx` · `useTicketEscalations.ts` | Displays audit log from `GET /api/tickets/{id}/escalations` newest-first. Formats before/after priorities, resolved agent names ("Unassigned" if null), formatted due dates ("No due date" if null), reason, actor, and timestamp. |
+| **Creation Triage Decision** | `CreateTicketPage.tsx` | Displays automatic triage decisions returned by `POST /api/tickets`: effective priority + reason, SLA due date + reason, and assigned agent + reason (or unassigned explanation). |
+| **Escalation Invariants** | `EscalationPanel.tsx` | Disables/hides escalation controls when ticket is Critical, Resolved, or Closed with explanatory messages, while also handling server 409 responses. |
+| **Strict Type Safety** | `apps/web/src/types/api.ts` | Fully typed API request/response contracts matching backend DTOs. Zero `any` and zero `@ts-ignore` across all touched code. |
+
+### Verification & Tests Run
+- **`npm test` (`apps/web`)**: 41 passed across 9 test files (Vitest):
+  - `SlaIndicator.test.tsx`: All 5 SLA states, text labels, accessibility attributes, badge tone styling.
+  - `TicketFilters.test.tsx`: SLA dropdown, user-friendly labels, filter selection/clearing, multi-filter combination.
+  - `useTicketList.test.ts`: SLA status parameter handling, immediate fetching, search debounce, and page-1 reset.
+  - `EscalationPanel.test.tsx`: Client validation (5–500 chars), missing actor, pending state, double-click suppression, 400/404/409 error handling, and availability rules.
+  - `EscalationHistory.test.tsx`: Loading, error retry, empty state, and transition formatting with null agent/due date handling.
+  - `CreateTicketPage.test.tsx`: Assigned triage display, unassigned explanation display, and reset flow.
+  - `TicketDetailPage.test.tsx`: In-place state refresh after escalation without full page reload.
+  - `api/tickets.test.ts`: Query string building and escalation API contract calls.
+  - `TicketTable.test.tsx`: Row rendering with SLA indicators.
+- **`npm run typecheck` (`tsc -b --noEmit`)**: 0 errors.
+- **`npm run lint` (`eslint .`)**: 0 errors, 0 warnings.
+- **`npm run build` (`tsc -b && vite build`)**: Succeeded cleanly in 710ms.
+
+---
+
 ## Quick start
 
 **Prerequisites:** .NET SDK 10 (`global.json`), Node.js 22 (`.nvmrc`; 20.19+ works), Docker.
