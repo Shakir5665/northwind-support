@@ -41,6 +41,31 @@ Full requirements are in **[`ASSIGNMENT_CANDIDATE.md`](ASSIGNMENT_CANDIDATE.md)*
 
 ---
 
+## Task 1.1 Defect Fix (DEFECT-117)
+
+### Root Cause
+The data-fetching `useEffect` in `apps/web/src/features/tickets/hooks/useTicketList.ts` watched only `[filters.search, filters.page, filters.pageSize]`. All non-search filters (`status`, `priority`, `categoryId`, `customerId`, `assignedAgentId`, `unassignedOnly`, `sortBy`, `sortDirection`) were omitted from the dependency array. Because `updateFilters` defaults `page` to `1`, changing a non-search filter while on page 1 left all watched dependencies unchanged, preventing the effect from firing and sending an API request. Furthermore, the effect wrapped the request in a blanket 300 ms `setTimeout`, which would have delayed non-search filters even if they were watched.
+
+### Implementation
+- **Decoupled Search Debounce**: Added a dedicated `useEffect` that listens exclusively to `filters.search` and updates an independent `debouncedSearch` state after 300 ms (`DEBOUNCE_MS`), clearing pending timers on successive keystrokes.
+- **Immediate Non-Search Requests**: Configured the data-fetching `useEffect` to watch `debouncedSearch` alongside all individual non-search filter properties (`filters.status`, `filters.priority`, etc.). When any non-search filter changes, this effect runs synchronously without timer delay, calling `ticketsApi.getTickets({ ...filters, search: debouncedSearch })`.
+- **Why Search Remains Debounced While Other Filters Are Immediate**: Keystrokes update `filters.search` immediately (keeping the search input responsive) but do not trigger data-fetching until `debouncedSearch` settles after 300 ms. Meanwhile, non-search filter changes update their respective state immediately and trigger the data-fetching effect right away using the current settled `debouncedSearch` and new filter value.
+- **Immediate Reset & Reload**: Updated `resetFilters` to reset both `filters` and `debouncedSearch` synchronously, and updated `reload` to query using active filters with `debouncedSearch`.
+
+### Verification & Tests Run
+- **Automated Regression Tests**:
+  - `npm run test --workspace apps/web`: 6 tests passing across 2 files in Vitest.
+  - Added 4 regression tests in `apps/web/src/features/tickets/hooks/useTicketList.test.ts` verifying:
+    1. Changing a non-search filter (`status`) triggers `getTickets` immediately without advancing timers.
+    2. Changing a filter while on a later page (e.g., page 2) triggers immediately and resets `page` to 1.
+    3. Typing in `search` delays the request by 300 ms, while subsequently changing `status` triggers immediately and preserves active search text.
+    4. Resetting filters immediately triggers a request with default filters.
+- **Code Quality**:
+  - `npm run lint --workspace apps/web` passed with 0 errors and 0 warnings.
+  - `npm run typecheck --workspace apps/web` passed with 0 errors.
+
+---
+
 ## Quick start
 
 **Prerequisites:** .NET SDK 10 (`global.json`), Node.js 22 (`.nvmrc`; 20.19+ works), Docker.
